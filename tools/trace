@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Run one brand's bridge by hand with every frame logged to stderr as hex.
+#
+#   tools/trace moto 54:2F:04:11:D5:E8 "moto buds+"
+#
+# Type commands (set anc, level 5, ...) and they go to the bridge; its JSON
+# lines and the frames in and out are printed. Ctrl-C ends it. Stop the bar's
+# own bridge for the device first (disable noise control in the widget's
+# settings, or `omarchy restart shell` with the device in its case): a
+# channel has one holder at a time.
+here="$(cd "$(dirname "$0")/.." && pwd)"
+export CORNERSTONE_TRACE=1 PYTHONDONTWRITEBYTECODE=1
+exec "$here/bridges/cornerstone-bridge" "$@"

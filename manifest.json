@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "cornerstone.phones",
   "name": "Cornerstone Phones",
-  "version": "1.3.19",
+  "version": "2.0.0",
   "author": "Kush Beaver Productionz",
   "license": "MIT",
-  "description": "Battery levels and noise-cancellation control for Bluetooth headphones, in the Omarchy bar. JBL, Sony, Samsung, Nothing / CMF, Soundcore, Xiaomi, Redmi, OPPO, Bose, TOZO, Huawei, EarFun; battery on anything with Google Fast Pair or BlueZ.",
+  "description": "Battery levels and noise-cancelling control for Bluetooth headphones in the Omarchy bar. Motorola, Sony, JBL, Samsung, Nothing and CMF, Soundcore, Xiaomi, Redmi, OPPO, Bose, TOZO, Huawei and EarFun; battery on anything with Google Fast Pair or a BlueZ battery figure.",
   "kinds": [
     "service",
     "bar-widget"
@@ -17,9 +17,11 @@
   },
   "barWidget": {
     "displayName": "Cornerstone Phones",
-    "description": "One icon per connected set, filling with its battery; the panel shows left, right and case, and switches Off / ANC / Ambient \u2014 with the ambient level on Sony and Soundcore, ANC strength and low latency on Nothing / CMF. Ambient level and ANC strength 1-7 on JBL Tour Pro 3. Six listening modes and left, right, case battery on TOZO NC9 Pro. Left, right, case battery on HUAWEI FreeBuds SE 2.",
+    "description": "One icon per connected set, filling with its battery. The panel shows left, right and case, and switches Off, ANC and Ambient where the headphones allow, with the extra controls some models have: an Ambient level, an ANC strength, low latency, TOZO's extra modes.",
     "category": "Audio",
     "aliases": [
+      "moto",
+      "motorola",
       "jbl",
       "tour pro",
       "airoha",
@@ -73,14 +75,14 @@
         "type": "boolean",
         "label": "Read battery over Google Fast Pair",
         "defaultValue": true,
-        "description": "Left, right and case levels over the Fast Pair channel. Off: battery from a supported noise-control bridge while noise control is enabled, otherwise BlueZ's single figure if available. JBL noise control needs Fast Pair for its BLE address; bridges using the device's own channel work without Fast Pair."
+        "description": "Left, right and case levels over the Fast Pair channel. Off: the battery comes from the headphones' own channel where a bridge reads it, otherwise from BlueZ's single figure. JBL noise control needs Fast Pair for its BLE address; every other brand works without it."
       },
       {
         "key": "useModeControl",
         "type": "boolean",
         "label": "Noise cancellation (Off / ANC / Ambient)",
         "defaultValue": true,
-        "description": "The MODE row, following changes made on the device too \u2014 plus the ambient level on Sony and Soundcore, the ANC strength and low-latency switch on Nothing / CMF, and the Ambient level and ANC strength on JBL Tour Pro 3. Works on Sony MDR v1 and v2, Samsung Galaxy Buds2, Nothing / CMF, Soundcore, Xiaomi Buds 5 Pro, Redmi Buds 3 Pro, OPPO Enco Air3 Pro, Bose QC45, Bose QC35, TOZO NC9 Pro, JBL Tour Pro 3, and some other JBL earbuds (those need Fast Pair above). Hidden when the device answers for none. TOZO NC9 Pro also offers Reduce Wind Noise, Leisure and Adaptive modes."
+        "description": "The MODE row in the panel, which also follows changes made on the headphones. Works on Moto Buds+, Sony (MDR v1 and v2), Samsung Galaxy Buds2, Nothing and CMF, Soundcore, Xiaomi Buds 5 Pro, Redmi Buds 5 and 3 Pro, OPPO Enco Air3 Pro, Bose QC45 and QC35, TOZO NC9 Pro, EarFun Air Pro 4, JBL Tour Pro 3 and some other JBL earbuds (those need Fast Pair). Hidden on headphones that answer for none."
       },
       {
         "key": "lowBatteryThreshold",
@@ -96,7 +98,7 @@
         "type": "boolean",
         "label": "Show a percentage instead of the drawn meters",
         "defaultValue": false,
-        "description": "On: the lower earbud's percentage next to the glyph, taking a second bar slot. Off: the levels fill the two halves of one drawn mark. A vertical bar always draws the mark."
+        "description": "On: the lower earbud's percentage next to the icon, taking a second bar slot. Off: the levels fill the two halves of one drawn icon. A vertical bar always draws the icon."
       },
       {
         "key": "hideWhenDisconnected",
@@ -115,7 +117,7 @@
         "type": "boolean",
         "label": "Pause media when a device disconnects or comes off your ears",
         "defaultValue": true,
-        "description": "Pauses every playing media player when a followed device disconnects (switched off, out of range) and, on headsets with a wear sensor (confirmed on the Sony WH-1000XM6), the moment it comes off your ears while still connected \u2014 and resumes exactly those players when it goes back on."
+        "description": "Pauses every playing media player when followed headphones disconnect (switched off, out of range) and, on headphones with a wear sensor, the moment they come off your ears. Putting them back on resumes exactly those players."
       }
     ]
   }
