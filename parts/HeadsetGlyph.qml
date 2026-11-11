@@ -70,8 +70,8 @@ Item {
       Item {
         id: bud
         required property int index
-        readonly property bool right: index === 1
-        x: right ? glyph.width - buds.inset - buds.bodyWidth : buds.inset
+        readonly property bool second: index === 1
+        x: second ? glyph.width - buds.inset - buds.bodyWidth : buds.inset
         width: buds.bodyWidth
         height: glyph.height
 
@@ -82,7 +82,7 @@ Item {
           color: glyph.tint
         }
         Rectangle {
-          x: bud.right ? 0 : bud.width - width
+          x: bud.second ? 0 : bud.width - width
           y: buds.bodyHeight - width
           width: buds.stemWidth
           height: glyph.height - y
