@@ -5,8 +5,8 @@ out from `PROTOCOL.md`; a capture is what `PROTOCOL.md` was written from.
 When a review asks "did this headset ever answer that frame", the answer is
 `grep` here rather than a memory.
 
-One file per model, `<brand>-<model>.txt`, the output of the brand's probe in
-`tools/` (or of an HCI snoop, decoded), unedited but for the parts that
+One file per model, `<brand>-<model>.txt`, the output of `tools/trace`
+(or of an older probe, or an HCI snoop, decoded), unedited but for the parts that
 identify you if you want them out. Name it from the pin:
 
 ```json

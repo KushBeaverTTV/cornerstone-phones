@@ -20,7 +20,7 @@ channel by a small module in `bridges/brands/`:
 | brand | battery | modes |
 |:--|:--|:--|
 | Motorola Moto Buds+ | left, right, case | Off, ANC, Ambient |
-| Sony (MDR v1 and v2) | headset or buds | Off, NC, Ambient, Ambient level, focus on voice |
+| Sony (MDR v1 and v2) | Fast Pair or BlueZ | Off, ANC, Ambient, Ambient level, focus on voice |
 | Samsung Galaxy Buds2 | left, right, case | Off, ANC, Ambient |
 | Nothing and CMF | left, right, case | Off, ANC grades, Transparency, low latency |
 | Soundcore | Fast Pair | Off, ANC, Ambient, level, wind noise reduction |

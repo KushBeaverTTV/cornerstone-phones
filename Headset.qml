@@ -297,7 +297,8 @@ Item {
       enabled: service.notifyLow,
       connected: connected,
       level: level,
-      source: battery.single ? "single" : battery.source === "bluez" ? "bluez" : "bud",
+      // What the figure was measured by, not which source drew the rows.
+      source: battery.single ? "single" : battery.perBud ? "bud" : "bluez",
       charging: charging,
       threshold: lowThreshold,
       notified: service.notifiedLow[address] === true

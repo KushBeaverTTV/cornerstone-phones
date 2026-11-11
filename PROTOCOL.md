@@ -1,5 +1,14 @@
 # What these headphones say, and how
 
+> **Reading this with the 2.0 code:** the protocol facts here are current. The
+> file names are from the pre-2.0 layout: each `<brand>-bridge` is now
+> `bridges/brands/<brand>.py` (run as `bridges/cornerstone-bridge <brand>`),
+> `gfps-reader` is `bridges/fastpair.py`, `Model.js` is `lib/`, and
+> `DeviceFollower.qml` is `Headset.qml`. The probes once in `tools/` are
+> replaced by `tools/trace`. Motorola Moto Buds+ are documented in
+> `bridges/brands/moto.py` and `docs/captures/moto-buds-plus.txt`.
+
+
 Notes from probing a **JBL TUNE230NC TWS** (`A0:11:22:33:44:55`, modalias
 `bluetooth:v02B0p0000d001F`, Fast Pair model id `71f20a`) and a **JBL Wave
 Buds 2** (`50:1B:6A:0B:0B:6E`, modalias `bluetooth:v0ECBp2100d001F`, Fast Pair

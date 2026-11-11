@@ -312,7 +312,7 @@ Panel {
     text: "Battery"
   }
 
-  component Row2: Item {
+  component LabelledRow: Item {
     // A label on the left and something on the right.
     property alias label: leftText.text
     default property alias trailing: holder.data
@@ -345,7 +345,7 @@ Panel {
     wrapMode: Text.WordWrap
   }
 
-  component Battery_: BatteryRow {
+  component PanelBattery: BatteryRow {
     lowThreshold: root.lowThreshold
     labelWidth: labelMetrics.width
     fontFamily: root.fontFamily
@@ -426,31 +426,31 @@ Panel {
           width: parent.width
           spacing: Style.space(8)
 
-          Battery_ {
+          PanelBattery {
             visible: !!root.current && root.current.single
             label: "Battery"
             level: root.current ? root.current.singleLevel : -1
             charging: !!root.current && root.current.singleCharging
           }
-          Battery_ {
+          PanelBattery {
             visible: !!root.current && root.current.perBud
             label: "Left"
             level: root.current ? root.current.leftLevel : -1
             charging: !!root.current && root.current.leftCharging
           }
-          Battery_ {
+          PanelBattery {
             visible: !!root.current && root.current.perBud
             label: "Right"
             level: root.current ? root.current.rightLevel : -1
             charging: !!root.current && root.current.rightCharging
           }
-          Battery_ {
+          PanelBattery {
             visible: !!root.current && root.current.perBud
             label: "Case"
             level: root.current ? root.current.caseLevel : -1
             stale: !!root.current && root.current.caseStale
           }
-          Battery_ {
+          PanelBattery {
             visible: !!root.current && !root.current.perBud && !root.current.single
               && root.current.bluezLevel >= 0
             label: "Battery"
@@ -509,7 +509,7 @@ Panel {
             width: parent.width
             visible: root.levelsVisible
             spacing: Style.space(6)
-            Row2 { label: "ANC level" }
+            LabelledRow { label: "ANC level" }
             ButtonGroup {
               width: parent.width
               options: root.levelButtons
@@ -527,7 +527,7 @@ Panel {
             visible: root.ambientVisible
             spacing: Style.space(6)
 
-            Row2 {
+            LabelledRow {
               label: "Ambient level"
               Text {
                 textFormat: Text.PlainText
@@ -548,7 +548,7 @@ Panel {
               value: root.askedAmbient >= 0 ? root.askedAmbient : Math.max(minimum, root.ambientNow)
               onMoved: function (value) { root.askAmbient(value) }
             }
-            Row2 {
+            LabelledRow {
               visible: root.voiceLabel !== ""
               label: root.voiceLabel
               ToggleSwitch {
@@ -565,7 +565,7 @@ Panel {
             visible: root.strengthVisible
             spacing: Style.space(6)
 
-            Row2 {
+            LabelledRow {
               label: "ANC strength"
               Text {
                 textFormat: Text.PlainText
@@ -588,7 +588,7 @@ Panel {
             }
           }
 
-          Row2 {
+          LabelledRow {
             visible: root.latencyVisible
             label: "Low latency"
             ToggleSwitch {
