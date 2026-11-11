@@ -1,0 +1,2613 @@
+# What these headphones say, and how
+
+Notes from probing a **JBL TUNE230NC TWS** (`A0:11:22:33:44:55`, modalias
+`bluetooth:v02B0p0000d001F`, Fast Pair model id `71f20a`) and a **JBL Wave
+Buds 2** (`50:1B:6A:0B:0B:6E`, modalias `bluetooth:v0ECBp2100d001F`, Fast Pair
+model id `ea59a0`) on Arch/BlueZ 5.87.
+Their *audio* side is BR/EDR only — every profile `bluetoothctl info` lists is
+RFCOMM or A2DP, and there is no GATT to read on it. The control protocol is on a
+separate LE connection: [further down](#the-control-protocol-lives-on-ble-and-it-is-fully-working).
+
+The [Sony section](#sony-mdr-v2--the-listening-mode-on-the-wh-ch720n) is a
+different device and a different protocol: a **Sony WH-CH720N**
+(`B0:11:22:33:44:55`), whose listening mode is on an RFCOMM channel of its own.
+The [Xiaomi section](#xiaomi-buds-5-pro--compact-gaia-on-spp) is Xiaomi Buds 5
+Pro: Compact GAIA on standard SPP. The [Soundcore section](#soundcore-space-2--vendor-rfcomm)
+is Soundcore Space 2: vendor RFCOMM (`0cf12d31-…`). Everything before Sony is the JBL.
+
+The tools that produced all of this are in [`tools/`](tools/). The Python
+probes each register an `org.bluez.Profile1` for one UUID, so BlueZ does the SDP
+lookup and hands over a connected RFCOMM socket; no `sdptool`, no root, nothing
+left registered after the process exits. [`tools/jbl-anc`](tools/jbl-anc) is the
+odd one out: it drives `btgatt-client` over LE, and shells out to
+`tools/gfps_probe.py` only to read the rotating BLE address, and only when there
+is no widget running to be asked for it.
+[`tools/sony_probe.py`](tools/sony_probe.py),
+[`tools/xiaomi_probe.py`](tools/xiaomi_probe.py), and
+[`tools/soundcore_probe.py`](tools/soundcore_probe.py) speak framed protocols rather
+than dumping bytes: Sony does the MDR handshake and asks each NC/ASM variant;
+Xiaomi does Compact GAIA on SPP; Soundcore queries state and sets sound modes.
+
+## The channels
+
+`bluetoothctl info` lists eleven UUIDs. The ones that matter:
+
+| UUID | What it is | Answers? |
+|---|---|---|
+| `df21fe2c-2515-4fdb-8886-f12c4d67927c` | Google Fast Pair Message Stream | **Yes — battery per earbud** |
+| `8a482a08-5507-42ac-b673-a88df48b3fc7` | JBL vendor channel | Yes: a 3-byte heartbeat unprompted, and a 1-byte `00` to every command tried |
+| `931c7e8a-540f-4686-b798-e8df0a2ad9f7` | Amazon AMA (Alexa), per Qualcomm ADK `ama_rfcomm.c` | one greeting frame on connect, then silence |
+| `66666666-…`, `81c2e72a-…`, `f8d1fbe4-…` | vendor channels | connect, then total silence |
+| `00001101-…` | plain SPP | connects, says nothing |
+
+And one that is not on this device at all, listed here because it is the other
+half of the widget's listening mode:
+
+| UUID | What it is | Answers? |
+|---|---|---|
+| `956c7b26-d49a-4ba8-b03f-b17d393cb6e2` | Sony MDR protocol v2 — served by the WH-CH720N and by the current WH/WF range | **Yes — listening mode**, [last section](#sony-mdr-v2--the-listening-mode-on-the-wh-ch720n) |
+| `96cc203e-5068-46ad-b32d-e316f5e069ba` | Sony MDR protocol v1, the older headsets | **Yes — listening mode**, [the WH-1000XM4](#wh-1000xm4) |
+
+## Fast Pair Message Stream — this is where the battery lives
+
+A public Google spec, not a JBL protocol:
+<https://developers.google.com/nearby/fast-pair/specifications/extensions/messagestream>
+
+Frame: `group u8 | code u8 | length u16 big-endian | payload`.
+
+What this device sends, unprompted, right after the channel opens:
+
+```
+0301 0003 71f20a           group 3 code 1  model id
+0302 0006 5b66778899aa     group 3 code 2  BLE address
+0303 0003 0a0aa2           group 3 code 3  battery
+```
+
+Code `0x09` in the same group is the firmware version, an ASCII string;
+`gfps-reader` decodes it and passes it through as `firmware` for any device that
+sends one, though nothing in the widget draws it.
+
+Battery payload is one byte per component — left, right, case — with the high
+bit meaning charging and the low seven bits the percentage. A byte of the form
+`0b?1111111` — `0x7F`, or `0xFF` with the charging bit set — means "no reading",
+which is what a bud sitting in the case reports:
+
+```
+0a 0a a2  ->  left 10%, right 10%, case 34% charging
+7f 0a a2  ->  left in the case, right 10%, case 34% charging
+```
+
+A one-byte payload means a set with a single battery — an over-ear headset like
+the WH-CH720N. `gfps-reader` reports that as `battery` with `single` true, and
+leaves left, right and case at -1: a headset with one battery has no left
+earbud, and a figure put in `left` reads downstream exactly like one that was
+measured there.
+
+The reader's JSON line, key by key:
+
+| Key | Meaning |
+|---|---|
+| `address` | which device the line is about, uppercase colon-separated. One reader serves every followed device, since BlueZ registers the profile once for the whole system; a line without an address is about the reader itself and is the last thing it writes |
+| `stream` | true while the channel is up; the `{address, stream, error}` line is the only place it is false |
+| `single` | true when the device reports one battery for the whole set |
+| `battery`, `batteryCharging` | that single figure, 0-100 or -1, and its charging bit; -1/false for a three-battery set |
+| `left`, `right`, `case` | 0-100, or -1 for "no reading"; all -1 when `single` |
+| `leftCharging`, `rightCharging`, `caseCharging` | that component's charging bit |
+| `modelId` | Fast Pair model id, hex; sent once per connection, then repeated in every later line |
+| `bleAddress` | the rotating BLE address, one-shot and sticky like `modelId` |
+| `firmware` | firmware version string, one-shot and sticky too |
+
+Two things worth knowing:
+
+- **It pushes.** The device sends a battery message on connect and again when a
+  level changes. There is nothing to poll, and no way to ask for a figure the
+  device thinks you already have — hence the widget's `r`, which sends
+  `refresh <address>` to the reader's stdin so it drops that one channel and the
+  device re-announces. `follow` and `unfollow` are the other two commands, and
+  they are how the set of devices changes without the registration going with
+  it.
+- **It beats BlueZ's number.** `org.bluez.Battery1` on this device comes from
+  the HFP battery indicator, which has ten steps: it read `0x14 (20)` while the
+  Message Stream reported 10% in both buds. Same hardware, coarser channel.
+
+## The RFCOMM vendor channel — a dead end worth recording
+
+`8a482a08-5507-42ac-b673-a88df48b3fc7` is the only RFCOMM channel that replies
+to a command, and it turned out not to be the one the app uses. Recorded because the
+framing differs from the BLE transport, and because the refusals below are what
+sent the search to BLE in the first place.
+
+Frame, worked out from its own replies:
+
+```
+magic u8 | cmd u8 | seq u8 | length u8 | payload[length] | checksum u8
+0xAA = request, 0xBE = response or notification
+checksum = (~sum(every preceding byte)) & 0xFF
+```
+
+Every observed checksum fits: `be 21 01 01 00 1e` sums to `0xe1`, and
+`~0xe1 = 0x1e`.
+
+Unprompted, roughly every two seconds:
+
+```
+be 50 00 03 000001 ed
+be 50 01 03 000001 ec     seq increments, payload never changes
+```
+
+Sending the JBL Headphones app's command set — taken from
+[GroupXyz2/bluetooth-py](https://github.com/GroupXyz2/bluetooth-py)'s
+`JblProtocol.kt`, captured over BLE GATT from the official Android app — with
+[`tools/jbl_probe.py`](tools/jbl_probe.py), which produced this table, gets the
+cmd echoed with a single `0x00` payload, every time:
+
+| Sent | Got back |
+|---|---|
+| `aa 9b 00 02 0101 b6` enable notifications | `be 9b 00 01 00 a5` |
+| `aa 21 00 01 30 03` version | `be 21 00 01 00 1f` |
+| `aa 25 00 01 00 2f` battery | `be 25 00 01 00 1b` |
+| `aa 91 00 01 11 b2` ANC state | `be 91 00 01 00 af` |
+| `aa 94 00 01 01 bf` model | `be 94 00 01 00 ac` |
+| `aa 77 00 02 01ff dc` capabilities | `be 77 00 01 00 c9` |
+
+The framing is right — the device mirrors the `seq` byte, and malformed frames
+produced `seq=0x01` instead. So `0x00` is this model answering "no" to each of
+those command numbers. That app's numbers came from a GATT-based JBL; a
+BR/EDR TUNE-series set evidently uses a different vocabulary on this channel.
+
+### The listening experiment, and its answer
+
+Listening on RFCOMM found nothing. Two rounds with
+[`tools/jbl_listen.py`](tools/jbl_listen.py), which writes nothing at all, while
+the earbud gesture switched modes repeatedly:
+
+- On `8a482a08`, three minutes of toggling produced 85 frames, every one the same
+  heartbeat `be 50 <seq> 03 000001`. The payload never varied.
+- A second round listened on `66666666`, `81c2e72a`, `f8d1fbe4` and the AMA
+  channel `931c7e8a` **at once** — four registrations, four open channels — through
+  another set of toggles. Total frames: one, the greeting `fe 03 01 00…00` that
+  AMA sends on connect.
+
+That was the right experiment on the wrong transport.
+
+## The control protocol lives on BLE, and it is fully working
+
+The Message Stream itself gave up the lead. Device information code `0x02` is the
+**BLE address**, and it is a resolvable private address, so it rotates and cannot
+be written down:
+
+```
+0302 0006 4a1122334455     ->  4A:11:22:33:44:55   (was 5B:66:77:88:99:AA an hour earlier)
+```
+
+On LE the earbuds advertise as `JBL TUNE230NC TWS-LE` and accept a connection.
+Their GATT tree carries a service whose UUID spells its own vendor:
+
+```
+65786365-6c70-6f69-6e74-2e636f6d0000
+65 78 63 65 = "exce"   6c 70 = "lp"   6f 69 = "oi"   6e 74 = "nt"   2e 63 6f 6d = ".com"
+```
+
+| handle | UUID | props | role |
+|---|---|---|---|
+| `0x000c` | `…2e636f6d0001` | `0x12` read + notify | the device talks here |
+| `0x0010` | `…2e636f6d0002` | `0x0c` write + write-without-response | commands go here |
+
+Enumerate it with:
+
+```bash
+btgatt-client -d <ble-address> -t random     # then: services
+```
+
+The rest of the tree, for the record: `0000fe2c` (Fast Pair, four
+notify/write characteristics `1234`-`1237`), `0000fe03` (with `2beea05b…`
+read/notify and `f04eb177…` write), `66666666-…`/`77777777-…`,
+`86868686-…`/`97979797-…`, plus generic access and attribute services.
+
+### Frames
+
+On this transport there is **no sequence byte and no checksum** — unlike the
+RFCOMM channel, which wanted both:
+
+```
+AA <cmd> <payload length> <payload…>
+```
+
+Confirmed exchanges, every one of them observed:
+
+| sent to `0x0010` | notified on `0x000c` | meaning |
+|---|---|---|
+| — | `aa 12 25 4a 42 4c 20 54 55 4e 45 32 33 30 4e 43 20 54 00 4b` | device name, `"JBL TUNE230NC T…"`, truncated by the 20-byte default ATT MTU |
+| `aa 21 01 30` | `aa 22 0d 30 00 02 00 04 df 01 00 00 01 00 00 00` | version; the one reply here that arrives under a different command byte |
+| `aa 9b 02 01 01` | `aa 9b 03 02 01 00` | enable notifications, acknowledged |
+| `aa 25 01 00` | `aa 25 0d 01 00 00 0a 1e 00 4e 10 0e 78 0e cc 0c` | battery |
+| `aa 91 01 11` | `aa 91 07 12 01 00 02 01 03 00` | listening mode |
+
+**How a reply is addressed.** Only the version exchange answers under `cmd + 1`
+(`0x21` → `0x22`). Everything else keeps the command byte and increments the
+first payload byte, the opcode: `0x91` `0x11` get is answered by `0x91` `0x12`
+report, `0x9b` `0x01` by `0x9b` `0x02`, `0x25` `0x00` by `0x25` `0x01`.
+
+**Battery, cross-checked against Fast Pair.** Byte offsets here are 0-based and
+count the leading `aa` as byte 0. Frame bytes 6, 7 and 9 read
+`0x0a`, `0x1e`, `0x4e` — 10, 30 and 78 — while the Message Stream reported
+left 10%, right 30%, case 78% at the same moment. Two independent channels, same
+numbers. Note that byte 8 is `00`: the case level is at **byte 9**, not byte 8 as
+[bluetooth-py](https://github.com/GroupXyz2/bluetooth-py) has it for its device.
+The tail `10 0e / 78 0e / cc 0c` reads as little-endian 3600, 3704 and 3276,
+which look like millivolts — *hypothesis, not verified*.
+
+### The slot order follows the spec, and the levels lag
+
+Google's Battery Notification spec says the three values are ordered *left bud,
+right bud, case*, with `0b?1111111` for unknown. This device obeys it. Verified by
+docking one known earbud: with the left in the case and the channel re-opened, the
+first byte reads `0x7F` and the second still reports.
+
+That test was run because a level appeared to jump between earbuds, which turned
+out to be something else: **an earbud's level is only as fresh as the last
+announcement.** The earbuds announce on connect and when a level changes, and
+docking an earbud is neither, so a bud parked in the case keeps showing its last
+level until something asks again. A bud that charged from 20% to 60% in the case
+therefore appears to "jump" when it comes back — that is the charged value
+arriving, not a slot mix-up.
+
+The widget re-opens the channel when the panel is opened and the last reading is
+over thirty seconds old, which is the only moment the freshness matters, and `r`
+forces it at any time.
+
+### The case is reported second-hand
+
+The battery frame carries the case like any other component, but the earbud
+sending it only knows what the case last told it, and the two disagree for a long
+time. Observed over one session on a TUNE230NC:
+
+| moment | case level | charging bit | actually |
+|---|---|---|---|
+| all afternoon | 78% | clear | on a charger part of that time |
+| case plugged in, one earbud inside | 78% | **clear** | charging |
+| after an earbud docked and came out | 98% | set | just off the charger |
+| case empty, no cable, 90+ seconds | 98% | **set** | charging nothing |
+
+So the level refreshes when an earbud docks and can talk to the case, and the
+charging bit is not cleared by anything on that timescale. Both are stale between
+those events. The earbuds' own levels, by contrast, track live: the right earbud
+read 100% within seconds of coming out of the case.
+
+The widget therefore shows the case's level and not its charging bolt. A level
+that lags is a small lie; a bolt that says "charging, now" with the cable out is a
+plain one.
+
+An earbud *in* the case reports `0x7F`, no reading, so a charging earbud is never
+visible either — and an earbud only charges in the case.
+
+### Listening modes
+
+Command `0x91`, then an opcode and slot/value pairs. Slot 1 is ANC, slot 2 is
+Ambient Aware, slot 3 is TalkThru. Opcodes: `0x10` set, `0x11` get, `0x12` report.
+
+| mode | payload | evidence |
+|---|---|---|
+| Off | `10 01 00 02 00 03 00` | set, reported back, read back |
+| ANC | `10 01 01 02 00 03 00` | set, reported back, read back, audibly engaged |
+| Ambient Aware | `10 01 00 02 01 03 00` | set, reported back; also the state found on arrival |
+| TalkThru | `10 01 00 02 00 03 01` | set, reported back — the slot is real on this model |
+
+Two behaviours worth knowing, both observed:
+
+- **A set is answered by a report.** Writing a mode produces an unsolicited
+  `aa 91 07 12 …` immediately, so there is no need to read back.
+- **The touch control reports too.** Holding the subscription while pressing the
+  earbud produced nine reports tracing the cycle **Off → ANC → Ambient Aware →
+  Off → …**. TalkThru is not in the touch cycle, but is settable over the
+  protocol. The device does *not* report on subscription alone: with nobody
+  touching anything, a fresh subscription stays silent until something changes.
+
+### Fast Pair Hearable Controls: absent
+
+Fast Pair standardised noise control in January 2024 as message group `0x08`
+(`0x11` get, `0x12` set, `0x13` notify — per the spec as read, unverified here,
+since nothing ever answered). This device predates it and ignores it:
+[`tools/gfps_probe.py`](tools/gfps_probe.py) writes `08 11 00 00` on the Message
+Stream 1.5 seconds after the channel opens, and that got no reply across three
+separate windows of 25, 90 and 12 seconds. Everything above is JBL's own protocol
+instead.
+
+### In the widget
+
+[`jbl-bridge`](jbl-bridge) is the same protocol as a long-lived process: it owns
+one BLE link, prints a JSON line whenever the mode changes, and takes `set <mode>`
+on stdin. Which notify/write handles to dial is chosen by the Fast Pair model id
+the service passes as its last argument — TUNE230NC `0x000c`/`0x0010`, Wave Buds
+2 `0xa205`/`0xa202`, anything else the TUNE230NC ones. The plugin's service spawns it while the earbuds are connected and
+writes commands into it — the service, not the panel, so a second monitor's
+widget does not mean a second link. That one conversation is why clicking a mode
+and hearing about a touch-control change come back the same way; a second
+connection would be refused with *Device or resource busy*.
+
+Two details that cost time. On bluez 5.87 `btgatt-client` flushes after every
+notification, so it needs no unbuffering of its own — but the stages after it in
+a shell pipeline block-buffer, which is why `tools/jbl-anc` pipes through
+`sed -u` and a line-buffered `grep`. And the BLE address rotates, so the bridge
+is restarted whenever the Message Stream reports a new one.
+
+A third, and it is bluetoothd's rather than the earbuds'. bluez 5.87 as shipped
+(Arch 5.87-2) dies with SIGSEGV in `device_found_callback` whenever some D-Bus
+client runs discovery with a UUID filter and a device advertises a matching
+UUID — the earbuds' Fast Pair `FE2C`, for one. `is_filter_match()` in
+`src/adapter.c` hands `queue_find()` its arguments swapped and calls the UUID
+string as a function; upstream fixed it six days after the release, in commit
+`82af2beaf` (bluez/bluez#2282). Nothing in this plugin scans or sets a filter,
+and the crash restarts bluetoothd and drops every headset regardless. Until
+a bluez with that commit ships, the one-line patch rebuilt into the distro's
+package is the fix.
+
+What the bridge's exit code means, because the answer to "does this model speak
+the protocol" is only some of the ways it can end:
+
+- **1, transient** — the link never opened, was refused, or closed under the
+  bridge. That says nothing about the device, so nothing is written down; the
+  service asks the reader, if it is running, to reopen the device's Fast Pair
+  channel, which makes the earbuds announce the BLE address they currently
+  hold, then tries again after 10 seconds, then 20, then 40, up to five minutes.
+- **3, linked but silent** — connected, discovered, asked, heard nothing. The
+  bridge records one miss against the Fast Pair model id in
+  `$XDG_STATE_HOME/cornerstone-phones/mode-support.json` and the service leaves that model
+  alone for the rest of the session. Three misses, which takes three sessions,
+  and the entry reads `"supported": false`: no link is opened for that model
+  again, ever. Three rather than one because a stale BLE address makes the
+  connection hang with no error at all.
+- **4, setup failure** — no `btgatt-client`, or arguments the bridge will not
+  take. Nothing is recorded, because that is about this machine; the model is
+  parked for the session and the reason is shown where the row would be.
+- **0** is a clean stop and means nothing at all.
+
+Delete the file to ask again.
+
+### The tool
+
+[`tools/jbl-anc`](tools/jbl-anc) does all three things from the command line:
+
+```bash
+jbl-anc get                              # ambient — answered by the widget
+jbl-anc set anc                          # anc — the widget writes the frame
+jbl-anc watch                            # the mode, then every change, touch included
+jbl-anc watch 60 AA:BB:CC:DD:EE:FF       # the same, with no widget to ask
+```
+
+`get` and `set` ask the running Cornerstone Phones widget first, over IPC
+(`omarchy-shell cornerstone-phones mode` and `setMode`), and take the answer when it is a
+real mode or a plain `ok`. `pending` and `busy` mean the widget's bridge is still
+connecting, so the same question is put again every half second for fifteen
+seconds and then given up on: the earbuds accept one ATT link and the widget is
+about to be holding it, so opening our own would only be refused. `unsupported`,
+`unavailable` and no shell at all fall back to the air, and that path needs the
+rotating BLE address: `omarchy-shell cornerstone-phones bleAddress` while the widget is up,
+because BlueZ allows one holder per profile UUID and a second Message Stream
+reader would simply be refused, and `tools/gfps_probe.py` when it is not. That
+second route is what the earbuds' *Classic* address is for, as a trailing
+argument or in `JBL_MAC`; with neither a widget nor an address `jbl-anc` says so
+rather than guessing.
+
+`watch` has no widget equivalent and is always the direct path — but the address
+still comes from the widget while one runs, so the trailing MAC is for when there
+is none. The earbuds accept one ATT link, so turn the widget's mode control off
+first (`useModeControl` false) or `btgatt-client` reports *Failed to connect*.
+
+### What not to do
+
+Do not sweep `cmd` from `0x00` to `0xFF` to see what answers. Somewhere in that
+space are the firmware-update, factory-reset and shutdown commands, and a blind
+sweep on the only earbuds you own is how you find them. The RFCOMM command
+numbers above are frames the official Android app is known to send, by way of
+bluetooth-py; the BLE payloads were worked out here, from what the earbuds
+reported back to the frames those numbers suggested.
+
+### The Wave Buds 2 — the same frames, higher handles
+
+A second JBL model captured on the same protocol: **JBL Wave Buds 2**, Fast
+Pair model id `ea59a0`, classic `50:1B:6A:0B:0B:6E`. `bluetoothctl info` on it
+lists the Fast Pair UUID plus the usual HFP/A2DP set; its control traffic sits
+on the same excelpoint service, but the value handles are not the TUNE230NC's.
+The TUNE230NC enumerated the service at the bottom of the tree (`0x000c` /
+`0x0010`); here the whole excelpoint service lives at `0xa200` and neither
+handle survived the move:
+
+| handle | UUID | props | role |
+|---|---|---|---|
+| `0xa205` | `…2e636f6d0001` | `0x10` notify | the device talks here |
+| `0xa202` | `…2e636f6d0002` | `0x0c` write + write-without-response | commands go here |
+
+Everything observed on it matches the TUNE230NC section frame for frame: the
+`aa 9b 02 01 01` notify-on, the `aa 91 01 11` mode query answered by an
+`aa 91 07 12 …` report, and every mode payload from the table above reporting
+back on the set. One session recorded the full cycle — initial state **ANC**,
+then Off, ANC, Ambient Aware and TalkThru, each with its report (the device
+sends each report twice), then back to ANC — verbatim in
+[`docs/captures/jbl-wave-buds-2.txt`](docs/captures/jbl-wave-buds-2.txt), with
+the `bluetoothctl info` listing in
+[`docs/captures/jbl-wave-buds-2-bluetoothctl.txt`](docs/captures/jbl-wave-buds-2-bluetoothctl.txt).
+
+Because the handles differ and the model id is the only thing a connect hands
+over for free, `jbl-bridge` carries a per-model table: `MODELS` is keyed by
+Fast Pair model id, picks the notify/write handles, and a model not listed
+keeps the TUNE230NC handles on which the protocol was first confirmed.
+
+Its Fast Pair Message Stream announces the same three DEVICE_INFO frames as
+every other pair here, unprompted on every channel open: model id `ea59a0`,
+then the session's current BLE address, then battery `03 03 00 03 32 3c 64` —
+left 50%, right 60%, case 100%, none charging — verbatim in
+[`docs/captures/jbl-wave-buds-2-fastpair.txt`](docs/captures/jbl-wave-buds-2-fastpair.txt).
+The `08 11 00 00` Hearable Control probe got no reply, as documented. The BLE
+address frame is the one the widget's reader republishes and the excelpoint
+bridge dials; across today's sessions it read `64:F7:09:7F:E2:9D`,
+`72:36:C8:11:D2:7F`, `67:6D:C6:10:DE:5F`, `4A:02:E4:49:B0:65` and
+`48:DD:7D:82:61:F8` at different times.
+
+Reconnect recovery is evidence now too: five Bluetooth disconnect/connect
+cycles in a row each re-announced the earbuds' current BLE address and the
+mode row came back on its own (all `anc`, no manual refresh), see
+[`docs/captures/jbl-wave-buds-2-reconnect-recovery.json`](docs/captures/jbl-wave-buds-2-reconnect-recovery.json).
+A rotation mid-session still leaves the announced address stale for the next
+attempt, which is what exit 1 above covers: the service reopens the channel
+and the earbuds announce the address they actually hold.
+
+The reopen was also run on the TUNE230NC, ten forced exit 1 with and without
+it: one reopen per exit, the mode back as fast as before, battery rows kept,
+no audio dropout, see
+[`docs/captures/jbl-tune230nc-tws-exit1-channel-cycle.txt`](docs/captures/jbl-tune230nc-tws-exit1-channel-cycle.txt).
+An address rotating in the middle of a session was not caught there.
+
+## Sony MDR v2 — the listening mode on the WH-CH720N
+
+A different headset and a different protocol, on a channel Sony serves itself:
+
+```
+956c7b26-d49a-4ba8-b03f-b17d393cb6e2   MDR protocol v2   <- WH-CH720N, WH-1000XM5, WF-1000XM5…
+96cc203e-5068-46ad-b32d-e316f5e069ba   MDR protocol v1   <- WH-1000XM4, the older range
+```
+
+Nothing had to be reverse engineered for this one. The frame format is in
+[Gadgetbridge](https://codeberg.org/Freeyourgadget/Gadgetbridge) (its Codeberg
+repository — the GitHub mirror is years stale) and the command tables are in
+[mos9527/SonyHeadphonesClient](https://github.com/mos9527/SonyHeadphonesClient),
+whose `libmdr/include/mdr/ProtocolV2T1.hpp` is generated from Sony's own message
+classes. What is written down here is only what this headset was seen to do,
+because the two projects disagree about this model and only the hardware
+settles it.
+
+**Opening it.** Register an `org.bluez.Profile1` with `UUID` set to the v2 UUID,
+`Role` `client`, `Channel` `0`, and BlueZ does the SDP lookup and hands over a
+connected socket in `NewConnection` — the same arrangement as the Fast Pair
+reader, and the same one-holder consequence. Two details cost an afternoon:
+
+- **`ConnectProfile` must be called asynchronously.** It is a D-Bus method on
+  the device object, and calling it blocking stalls the very GLib loop that is
+  supposed to deliver `NewConnection`, so the connection completes and the
+  callback never arrives. With `reply_handler`/`error_handler` it works.
+- **The first attempt usually fails**, with `br-connection-busy`: bluetoothd is
+  still doing its own SDP and profile setup. A retry 1.5 seconds later
+  connects. Gadgetbridge's equivalent is a flat 500 ms wait before opening the
+  socket at all, "connecting too fast fails" — the bridge does both, waiting
+  half a second after registering and then retrying patiently.
+
+And then nothing happens: **the channel is silent until the handshake goes out.**
+An open socket with no traffic is the normal state, not a fault.
+
+### Frames
+
+```
+  3E  <TYPE> <SEQ> <LEN0 LEN1 LEN2 LEN3> <PAYLOAD…> <CKSUM>  3C
+  ^   \_______________________________________________________/  ^
+start        this whole span is byte-stuffed                     end
+```
+
+| field | size | meaning |
+|---|---|---|
+| start | 1 | `0x3E`, never escaped |
+| type | 1 | `0x0C` command, `0x01` ACK (also `0x0E`, a second command table) |
+| seq | 1 | one toggling bit, `0x00` or `0x01` |
+| length | 4 | big-endian uint32, of the **unescaped** payload, checksum excluded |
+| payload | N | byte 0 is the command |
+| checksum | 1 | `sum(type, seq, len[0..3], payload) & 0xFF` |
+| end | 1 | `0x3C`, never escaped |
+
+Escaping is `0x3D`, applied to `0x3C`, `0x3D` and `0x3E` inside the stuffed span:
+the byte becomes `3D` followed by `byte & 0xEF`, and unescaping ORs `0x10` back
+in. So `3C → 3D 2C`, `3D → 3D 2D`, `3E → 3D 2E`. Order matters: checksum over the
+unescaped bytes, then escape the whole `type|seq|len|payload|cksum` blob, then
+wrap it in the markers. Payload `3E 3C 3D` encodes to
+`3e 0c 00 00 00 00 03 3d 2e 3d 2c 3d 2d c6 3c`.
+
+The pleasant consequence is that `0x3C` cannot occur inside a frame, so "scan to
+the next `0x3C`" is a *correct* framer, not a heuristic. Which is just as well,
+because one `recv()` is not one frame: they arrive glued together and split in
+half, and both were seen on this headset.
+
+**The ACK carries `1 - seq`, never `seq`.** This is the one rule that is easy to
+get wrong and fatal to get wrong, and both reference implementations say the
+same thing:
+
+```
+device sent seq=0  ->  we send  3e 01 01 00 00 00 00 02 3c
+device sent seq=1  ->  we send  3e 01 00 00 00 00 00 01 3c
+```
+
+Every received `0x0C`/`0x0E` frame is ACKed, unsolicited notifications included,
+and ACKed first thing, before it is acted on. ACKs are never themselves ACKed.
+Our own outgoing sequence number is whatever the last received ACK carried, and
+only one command may be outstanding at a time: send, wait for the ACK, send the
+next.
+
+### The handshake, and what this headset answered
+
+The first frame on the socket is `CONNECT_GET_PROTOCOL_INFO`, payload `00 00`:
+
+```
+we send    3e 0c 00 00 00 00 02 00 00 0e 3c
+we get     ACK
+then       payload  01 00 03 00 10 02 00 00
+```
+
+The reply's command is `0x01`, `CONNECT_RET_PROTOCOL_INFO`, and **its length is
+the protocol generation**: 4 bytes is v1, 8 bytes is v2. Eight, so v2, which is
+what the UUID already implied and is worth confirming anyway. Gadgetbridge sends
+this up to three times because headsets sometimes ignore the first one; the
+bridge does the same.
+
+### Asking for the listening mode
+
+The NC/ASM block of the v2 command table:
+
+```
+0x66 NCASM_GET_PARAM   0x67 NCASM_RET_PARAM   0x68 NCASM_SET_PARAM   0x69 NCASM_NTFY_PARAM
+```
+
+Payload byte 1 is the **inquired type**, which selects *which variant* of the
+control this model implements and therefore how many bytes follow and what they
+mean. It is not derivable from the model name, and the two open implementations
+disagree about this one: Gadgetbridge's WH-CH720N profile sends `0x15`, which
+its own bug tracker records as not working, while mos9527's client derives the
+type from the headset's capability list and only implements `0x17`, `0x19`,
+`0x22` and `0x30`.
+
+So ask the headset. A GET is two bytes and costs nothing:
+
+```
+3e 0c 00 00 00 00 02 66 17 8b 3c     66 17  ->  answered, RET 67 17 …, 7 bytes
+3e 0c 00 00 00 00 02 66 15 89 3c     66 15  ->  ACKed, then nothing, ever
+3e 0c 00 00 00 00 02 66 22 96 3c     66 22  ->  ACKed, then nothing, ever
+```
+
+**`0x17` it is** — `MODE_NC_ASM_DUAL_NC_MODE_SWITCH_AND_ASM_SEAMLESS`, which is
+exactly what the headset offers: three states and a 20-step ambient dial. Note
+what a wrong guess looks like: not an error, not a refusal, just an ACK and
+silence. That is why the bridge gives each candidate a deadline rather than
+waiting for a "no" that never comes.
+
+### The 7-byte block
+
+```
+idx: 0    1     2                  3                 4          5                 6
+     cmd  0x17  valueChangeStatus  ncAsmTotalEffect  ncAsmMode  ambientSoundMode  level
+```
+
+| field | values |
+|---|---|
+| `valueChangeStatus` | `0x00` under changing — a slider being dragged — `0x01` changed. A SET sends `0x01`. |
+| `ncAsmTotalEffect` | the master switch: `0x00` off, `0x01` on |
+| `ncAsmMode` | which of the two when on: `0x00` noise cancelling, `0x01` ambient |
+| `ambientSoundMode` | `0x00` normal, `0x01` Focus on Voice |
+| `level` | ambient sound level, `0x00`-`0x14`, i.e. 0-20 |
+
+So the three states are `effect 0` (off), `effect 1 / mode 0` (noise cancelling)
+and `effect 1 / mode 1` (ambient). The last two bytes are carried in every frame
+whatever the state, and both directions echo whatever is stored.
+
+The other two layouts, for reference: `0x15` inserts an `ncValue` byte at index 5
+and is 8 bytes; `0x22` is ambient-only and drops `ncAsmMode`, 6 bytes. In all
+three the focus flag and the level are the last two bytes, which is why a decoder
+that reads them off the tail copes with all of them.
+
+### What the headset actually said
+
+Captured on the WH-CH720N, payloads exactly as they went out and came back:
+
+```
+->  66 17                       GET
+<-  67 17 01 01 00 00 14        RET: changed, on, noise cancelling, normal, level 20
+
+->  68 17 01 01 01 00 0a        SET: ambient, focus off, level 10
+<-  ACK
+->  66 17                       GET, immediately after
+<-  67 17 01 01 00 00 14        …the OLD state, unchanged
+<-  69 17 01 01 01 00 0a        NTFY, ~0.3 s later: the new state
+```
+
+Two behaviours follow from that, and both are load-bearing:
+
+- **A readback after a SET is stale; the notification is the truth.** The SET is
+  ACKed in milliseconds, the headset applies it about a third of a second later,
+  and a GET in between answers with the old state in perfect good faith. So
+  nothing reads back after a set — `sony-bridge` reports state only from a RET
+  or an NTFY, and a click in the panel lands on screen when the headset says it
+  has landed. Which is the same behaviour as pressing the button on the headset,
+  by construction rather than by effort.
+- **The level is applied only by an ambient SET.** Sending `68 17 01 01 00 00 05`
+  — noise cancelling, level 5 — leaves the stored level alone, and the headset
+  echoes back the level it already had. That is why `setAmbientLevel` puts the
+  headset into ambient as part of setting the level: there is no other way to
+  store it.
+
+Fully encoded, the two frames above, with the sequence numbers they happened to
+carry:
+
+```
+SET ambient level 10   3e 0c 01 00 00 00 07 68 17 01 01 01 00 0a a0 3c
+NTFY that followed     3e 0c 00 00 00 00 07 69 17 01 01 01 00 0a a0 3c
+                       and we must reply    3e 01 01 00 00 00 00 02 3c
+```
+
+### In the widget
+
+[`sony-bridge`](sony-bridge) is this protocol as a long-lived process, and the
+sibling of [`jbl-bridge`](jbl-bridge): it registers the profile, holds the one
+channel, prints a JSON line whenever the state changes and takes commands on
+stdin — `set off`, `set anc`, `set ambient`, `level <0-20>`, `voice on|off`. The
+plugin's service spawns it while a Sony headset is connected and picks the
+backend from the SDP UUID rather than from a probe or a name. Both bridges write
+the same line shape, so the rest of the widget does not know which one is
+running:
+
+```json
+{"modes": true, "mode": "ambient", "available": ["off","anc","ambient"], "level": 10, "voice": false}
+```
+
+`available` is what the answering inquired type can do — `0x17` and `0x15` give
+Off/ANC/Ambient, `0x22` gives Off/Ambient — and it is what the panel draws
+buttons and keys for. There is no TalkThru on this protocol at all. `level` and
+`voice` are the Ambient half of the same line, and the panel draws them under
+the buttons as a slider and a switch while Ambient is the mode; a line that
+reports a level at all is how the widget knows this device has them, since the
+JBL bridge never sends one.
+
+What the exit code means, the same four the JBL bridge uses:
+
+- **1, transient** — the profile never connected after ten tries, the handshake
+  went unanswered, or the channel closed under the bridge. Says nothing about
+  the headset, so the service retries after 10 seconds, then 20, then 40, up to
+  five minutes.
+- **3, linked but silent** — the handshake worked and every candidate inquired
+  type was asked and none answered in its three seconds. This headset speaks the
+  protocol but not this part of it, so the address is parked for the session and
+  no reason is shown: it is an answer, not a fault.
+- **4, setup failure** — bad arguments, or python-dbus/PyGObject missing. About
+  this machine and not about the headset; the address is parked for the session
+  and the panel says why, where the row would have been.
+- **0** is a clean stop — SIGTERM, or the widget closed the pipe — and means
+  nothing at all.
+
+Nothing is written to disk on this path, unlike the JBL one. The UUID makes the
+next session's decision for free, and a headset that gains the feature in a
+firmware update should not have to argue with a cache.
+
+### The probe
+
+[`tools/sony_probe.py`](tools/sony_probe.py) is the reference for all of the
+above and the thing every frame here was read off:
+
+```bash
+tools/sony_probe.py B0:11:22:33:44:55                  # 25 seconds of everything it says
+tools/sony_probe.py B0:11:22:33:44:55 40               # for longer
+tools/sony_probe.py B0:11:22:33:44:55 25 set:ambient:10:0   # …and set one mode on the way
+```
+
+It registers the profile, waits for BlueZ to connect it, sends the handshake,
+ACKs everything, asks `NCASM_GET_PARAM` with each candidate type in turn and
+prints every frame in both directions with a timestamp. The reply that echoes
+the type you asked for, and its payload length, is the whole answer: that is
+what a bridge for that headset must speak. The optional `set:` writes one mode
+afterwards using the layout the headset answered with, which is how the
+stale-readback and stored-level behaviours above were pinned down.
+
+The widget's own bridge holds the same profile, so turn `useModeControl` off
+before running the probe, or BlueZ will refuse the registration to whichever
+asks second.
+
+### WH-1000XM5
+
+Confirmed on a **Sony WH-1000XM5** (`AC:80:0A:14:69:53`, modalias
+`usb:v054Cp0DF0d0251`). It serves the same MDR v2 UUID (`956c7b26-…`) and the
+Fast Pair Message Stream (`df21fe2c-…`). Battery is one figure for the set.
+The inquired type and the 7-byte layout are the CH720N's; these are the bytes
+it sent.
+
+Handshake, `CONNECT_RET_PROTOCOL_INFO`, 8 bytes so v2:
+
+```
+01 00 03 00 20 16 00 00
+```
+
+The CH720N's reply was `01 00 03 00 10 02 00 00` — same length, different
+capability bytes, same generation.
+
+```
+->  66 17                       GET
+<-  67 17 01 01 01 00 14        RET: changed, on, ambient, normal, level 20
+->  66 15                       GET
+<-  ACK, then nothing
+->  66 22                       GET
+<-  ACK, then nothing
+```
+
+SETs built on that `0x17` block were applied: Off, ANC and Ambient each
+landed. No other inquired type was answered, and nothing else was sent.
+
+### WH-1000XM4
+
+Confirmed on a **Sony WH-1000XM4** (`94:DB:56:D0:F0:F0`, modalias
+`usb:v054Cp0D58d0301`). It serves the MDR v1 UUID (`96cc203e-…`) and the
+Fast Pair Message Stream (`df21fe2c-…`). Battery is one figure for the set.
+The protocol is v1, not v2 — the handshake answers with 4 bytes, and the NC/ASM
+command bytes (`0x66`–`0x69`) are the same but the inquired types and payload
+layout differ.
+
+Handshake, `CONNECT_RET_PROTOCOL_INFO`, 4 bytes so v1:
+
+```
+01 00 70 00
+```
+
+The answering payload is the v1 `NcAsmParam` struct — 7 bytes after the command
+byte:
+
+```
+idx: 0    1     2             3       4        5       6       7
+     cmd  type ncAsmEffect   ncType  ncValue  asmType asmId   asmValue
+```
+
+| field | values |
+|---|---|
+| `ncAsmEffect` | `0x00` off, `0x01` on; a SET sends `0x11` (adjustment completion) for on |
+| `ncType` | `0x02` (`DUAL_SINGLE_OFF`) — the v1 enum; the headset always reports this |
+| `ncValue` | `0x00` off — with the effect on, this is ambient sound; `0x01` SINGLE (wind noise reduction); `0x02` DUAL (noise cancelling) |
+| `asmType` | `0x01` — the only value seen; the bridge writes back what it read |
+| `asmId` | `0x00` normal, `0x01` voice |
+| `asmValue` | ambient level, `0x00`-`0x14` (0-20) |
+
+What the headset actually said:
+
+```
+->  66 02                       GET NC+ASM
+<-  67 02 01 02 02 01 00 00     RET: on, DUAL_SINGLE_OFF, nc=NC, asm normal, level 0
+```
+
+The SET (`0x68`) uses effect `0x11` for on, setting type `0x01`, and `ncValue`
+`0x02` for noise cancelling or `0x00` for ambient, with the level in the last
+byte only in ambient:
+
+```
+->  68 02 00 01 00 01 00 00     SET off
+->  68 02 11 01 02 01 00 00     SET ANC
+->  68 02 11 01 00 01 00 14     SET ambient, level 20
+<-  69 02 01 02 00 01 00 14     NTFY: on, ncValue 0, level 20
+```
+
+Off / ANC / Ambient and the ambient level were each confirmed by ear on a
+second WH-1000XM4 (firmware 3.0.1, [capture](docs/captures/sony-wh-1000xm4-ambient.txt)).
+The NTFY (`0x69`) follows a SET with the new state, and with effect `0x11` it
+carries the level that was sent. An earlier version sent ambient as
+`68 02 01 02 01 01 00 00`: the headset accepts and echoes it, but `ncValue`
+`0x01` is wind noise reduction, so no outside sound comes through.
+
+In noise cancelling the headset reports level `0x00` (`69 02 01 02 02 01 00 00`
+after an ambient at 20), while effect off keeps the level (`69 02 00 02 00 01
+00 14`). So the bridge remembers the last level above zero this headset
+reported, and a `set ambient` that finds the reported level at zero sends that
+one; with nothing remembered it sends 1, the bottom of the dial. v1 only: a v2
+headset keeps its level across modes and is sent what it was.
+
+Sony's v1 table also numbers an NC-only `0x01` and an ambient-only `0x03`. Both
+were asked on this headset and neither was answered, so neither is in the
+bridge: their block lengths are unconfirmed, and a variant nobody has seen
+answered would be a guess sent to somebody's working headphones.
+
+### WH-CH520: battery only, no ANC/Ambient
+
+A **Sony WH-CH520** (`E8:9E:13:CF:9A:71`, modalias `usb:v054Cp0EADd1000`).
+Sony's own listing for this model has no ANC or Ambient mode, and this
+section is the hardware evidence for why the plugin treats it that way
+despite the MDR channel answering as if it had one. Full transcripts:
+[`docs/captures/sony-wh-ch520.txt`](docs/captures/sony-wh-ch520.txt) (MDR,
+five runs) and
+[`docs/captures/sony-wh-ch520-fastpair.txt`](docs/captures/sony-wh-ch520-fastpair.txt)
+(Fast Pair, three runs).
+
+It serves the same MDR v2 UUID (`956c7b26-…`) as the CH720N. Handshake,
+`CONNECT_RET_PROTOCOL_INFO`, 8 bytes so v2:
+
+```
+01 00 03 00 10 01 00 00
+```
+
+Asked directly (`tools/sony_probe.py`, not what the bridge sends this model
+— see below), the 0x17 block and its layout look exactly like the CH720N's:
+
+```
+->  66 17                       GET
+<-  67 17 01 01 00 00 01        RET: on, NC (not ambient), voice off, level 1
+->  66 15                       GET
+<-  ACK, then nothing
+->  66 22                       GET
+<-  ACK, then nothing
+->  66 02                       GET
+<-  ACK, then nothing
+```
+
+But **no SET was ever seen to change anything it reported.** Four separate
+connections each sent one SET — `off`, `ambient` (with a level), a redundant
+same-state `nc`, and a live re-assertion through the widget's own
+(pre-fix) bridge — and every one of them was ACKed at the transport level
+and then contradicted by the very next `NCASM_GET_PARAM 0x17`, which kept
+reporting exactly the pre-write state, for as long as thirteen seconds with
+no unsolicited `0x69` in between either:
+
+```
+->  68 17 01 00 00 00 0a        SET off        (this probe's own default level)
+<-  ACK
+->  66 17 (readback)
+<-  67 17 01 01 00 00 01        unchanged: still on, still NC, still level 1
+
+->  68 17 01 01 01 00 0a        SET ambient, level 10
+<-  ACK
+->  66 17 (readback)
+<-  67 17 01 01 00 00 01        unchanged
+```
+
+The returned block is not evidence of a working ANC/Ambient control.
+The probe observed unchanged replies after writes; it does not establish
+why the firmware returns this block.
+
+The wear question gets the same non-answer, asked directly rather than
+inferred (`tools/sony_wear_probe.py`, a fourth standalone tool — none of the
+others send this frame on their own):
+
+```
+->  f2 10                       SYSTEM_GET_STATUS, wearing status
+<-  ACK, then nothing for 20s
+```
+
+And battery is not this channel's business regardless: three separate Fast
+Pair Message Stream connections (12s, 30s, 60s) get model id, BLE address
+and firmware unprompted, same as every other device in this file, but never
+once the `group 3 code 3` battery frame the CH720N and every other
+single-figure Sony device send right alongside them. The 100% the panel
+shows is BlueZ's own native reading — `Service.qml`'s documented fallback
+for "the Message Stream has said nothing" — not anything from this channel.
+
+Put together: this model gets sony-bridge's `NO_MODES`, not a `MODELS` row.
+It is asked nothing at all on the MDR channel — not `0x17`, not `f2 10` —
+and exits `EXIT_UNSUPPORTED` right after the handshake, the same "linked but
+silent" path an actually-silent headset takes, so the shell parks it and the
+panel shows battery with no mode row. Whether the headset's own physical
+button does anything this channel would ever see was not tested: nothing in
+this session can press it, and it would not change what Sony documents
+about the hardware regardless. `tests/pins/sony/wh-ch520.json` pins exactly
+the asked-nothing path. See [the review evidence notes](docs/SONY-WH-CH520-REVIEW.md)
+for the battery source and the historical live report.
+
+What the bridge does with all this: `sonyUuidFor()` in `Model.js` picks which of
+the two UUIDs to hand it, and the bridge registers that one — that is all the
+UUID decides. The handshake's length **orders** the questions, `0x02` first on a
+4-byte reply and `0x17` first on an 8-byte one, and never shortens the list: a
+headset that replies short is still asked `0x17`, `0x15` and `0x22` before it is
+given up on, because two models answer `0x17` today and neither may be lost to a
+guess about a third. What settles the layout is the type that answers — the
+numbers do not collide across the two generations, so a `0x02` block is read as
+v1 and a `0x17` block as v2, whatever the UUID and the handshake suggested. Once
+a type has answered, a block of any other type is dropped.
+
+`tests/sony_bridge_test.py` pins one session per model — this one, the CH720N,
+the WH-1000XM5 and the WH-CH520 — frame for frame.
+
+## WH-1000XM6: NCASM 0x19 notifications and wear status
+
+The WH-1000XM6 answers the regular NCASM query on type `0x17`, but reports
+subsequent mode changes with an unsolicited `0x19` notification. Its effect
+and ambient-mode bytes occupy the same positions as `0x17`; the wider block
+adds trailing bytes. The bridge therefore never probes `0x19`, but accepts and
+decodes it when the headset volunteers it.
+
+The wear sensor uses the SYSTEM status class, independently from NCASM:
+
+```text
+f2 10          SYSTEM_GET_STATUS, wearing status
+f3 10 00       RET: worn
+f5 10 01 01    NTFY: not worn
+f5 10 01 00    NTFY: worn
+```
+
+The reply and notification have different widths, so the final byte is the
+state: `0x00` means worn and any other value means not worn. The bridge asks
+once after the protocol handshake, then consumes the headset's unsolicited
+notifications. This layout and the automatic media pause/resume path are
+confirmed on the Sony WH-1000XM6.
+
+Which headsets are asked is a row in `MODELS` in `sony-bridge`, keyed by the
+name the headset reports (`bluetoothctl info` shows it as `Name`), which
+`DeviceFollower.qml` passes as the bridge's third argument. The WH-CH720N,
+the WH-1000XM5 and the WH-1000XM4 are not asked — none of them has been seen
+to answer `f2 10`, and their sessions in `tests/sony_bridge_test.py` are
+unchanged by this — while a model with no row is, on the chance it has a
+sensor; an unanswered question costs nothing, since `worn` is only ever set
+by a reply. The WH-CH520 is a third case, `NO_MODES` rather than a `MODELS`
+row: it is asked nothing on this channel at all, `f2 10` included — see its
+own section above.
+
+## Xiaomi Buds 5 Pro — Compact GAIA on SPP
+
+A third device and a third protocol, confirmed on **Xiaomi Buds 5 Pro**
+(`64:8F:DB:87:06:CB`, Qualcomm QCC-7228). There is no Google Fast Pair UUID, so
+per-earbud battery over the Message Stream is not available. BlueZ's HFP figure
+is the one the widget already shows. Two GATT Battery Service instances
+(`0000180f` / `00002a19`) exist on the device object, but ATT reads fail with
+*Not connected* while Classic A2DP is up; the GET on this channel that Moondrop
+uses for left/right percent (`0x1A01`) answered `01 00` / `02 00` / `03 ff`
+against a live BlueZ reading of ~90%, so those bytes are not a usable
+percentage. Listening mode is what this section is about.
+
+`bluetoothctl info` lists, among others:
+
+| UUID | What it is | Answers? |
+|---|---|---|
+| `00001100-d102-11e1-9b23-00025b00a5a5` | CSR GAIA | advertised; `ConnectProfile` returns *not supported* |
+| `00001101-0000-1000-8000-00805f9b34fb` | standard SPP | **Yes - handshake, GET/SET listening mode** |
+| `00000837-d103-0004-bf7f-2942153d354b` | vendor SPP (vivo uses this) | connects, no replies |
+| `2587db3c-ce70-4fc9-935f-777ab4188fd7` | vendor | *not supported* |
+| `df21fe2c-2515-4fdb-8886-f12c4d67927c` | Fast Pair Message Stream | **absent** |
+
+The widget picks this backend from the CSR GAIA UUID in the SDP record, then
+opens **SPP**. Same Profile1 arrangement as Sony: `Role` `client`, `Channel` `0`,
+async `ConnectProfile`, retry on `br-connection-busy`. `AutoConnect` must stay
+false: with it on, BlueZ handed a second socket and the probe replayed its plan
+on top of itself.
+
+Do not send Xiaomi `FE DC BA …` frames on this socket: they closed it. Do not
+send GAIA v1 factory-reset / power-off (`0x0104`, `0x0202`, `0x0204`).
+
+### Frames
+
+Compact GAIA, the same wrapping Moondrop and vivo use:
+
+```
+FF <ver> <flags=00> <payloadLen> <vendor u16be> <cmd u16be> <payload>
+```
+
+This device replies with **version 3**. Flags stayed 0 (no checksum, no
+extended length). Several frames can arrive in one `read()`.
+
+Handshake, vendor `0x000A` (generic GAIA):
+
+```
+->  ff 03 00 00  000a 0300
+<-  ff 03 00 04  000a 8300  00030301
+```
+
+Device commands use vendor `0x001D` (QTIL GAIA v3 / the same vendor Moondrop
+uses). GET response = GET + `0x0100`. Error = that value with `0x0080` set,
+payload a GAIA status (`05` invalid parameter, `01` not supported).
+
+### Listening mode
+
+| sent | reply | meaning |
+|---|---|---|
+| `0x1003` empty | `0x1103` 5 bytes | GET |
+| `0x1004` 1 byte | `0x1104` empty | SET ack |
+| `0x1004` 5 bytes (a copy of GET) | `0x1184` payload `05` | rejected |
+
+GET payloads actually seen, first byte echoing the SET byte:
+
+| SET | GET payload | panel name |
+|---|---|---|
+| `00` | `00 01 00 00 00` | Off (confirmed: panel Off) |
+| `01` | `01 01 01 00 00` | ANC (confirmed: panel ANC; byte 2 is 1 only here) |
+| `02` | `02 01 00 01 00` | Ambient / transparency (same extra flags as 0x03/0x04; SET did not drop the link) |
+| `03` | `03 01 00 01 00` | accepted, not offered |
+| `04` | `04 01 00 01 00` | **reboots the buds** - Moondrop's transparency byte on this vendor; never send |
+
+Off and ANC were confirmed by using the panel. Ambient was first mapped to
+`0x04` because that is Moondrop's SET value; the buds reboot when it is sent,
+so Ambient is `0x02` instead. `0x03` is still unnamed. Nothing unsolicited
+arrived when the GET was left alone; the bridge polls GET every 2.5 s so a
+press on the bud still updates the panel.
+
+### In the widget
+
+[`xiaomi-bridge`](xiaomi-bridge) is the sibling of [`sony-bridge`](sony-bridge):
+same JSON line, same stdin `set <mode>`, same four exit codes, Classic address,
+address parked for the session on exit 3. No `level` / `voice` keys - this
+protocol has no ambient dial.
+
+```json
+{"modes": true, "mode": "anc", "available": ["off","anc","ambient"]}
+```
+
+### The probe
+
+[`tools/xiaomi_probe.py`](tools/xiaomi_probe.py):
+
+```bash
+tools/xiaomi_probe.py 64:8F:DB:87:06:CB
+tools/xiaomi_probe.py 64:8F:DB:87:06:CB 15 set:ambient
+```
+
+Turn `useModeControl` off first: SPP is one holder, like Sony's UUID.
+
+
+## Redmi Buds 5 — RCSP on the 0xFD2D service
+
+A second Xiaomi protocol, on a different device and a different channel from
+the Buds 5 Pro above: confirmed on **Redmi Buds 5** (firmware `0.0.1.0` as the
+Fast Pair stream reports it). Do not send these frames on the Buds 5 Pro's SPP
+socket, and do not send Compact GAIA here: the two sets of earbuds share a
+brand and nothing else. The frames below are the ones the Xiaomi Earbuds app
+(`com.mi.earphone` 1.38.0) writes, read from its code and then sent to the
+earbuds; every answer in this section was seen. The capture is
+[`docs/captures/redmi-buds-5.txt`](docs/captures/redmi-buds-5.txt), the SDP
+record [`docs/captures/redmi-buds-5-bluetoothctl.txt`](docs/captures/redmi-buds-5-bluetoothctl.txt).
+
+`bluetoothctl info` lists, among others:
+
+| UUID | What it is | Answers? |
+|---|---|---|
+| `df21fe2c-2515-4fdb-8886-f12c4d67927c` | Fast Pair Message Stream | **Opens, and its battery is not to be believed**: a model id (`2b677d`), an all-zero BLE address and firmware `0.0.1.0`, and then, depending on the session, no battery frame (150 s, including with a bud put in the case and taken out), one byte `fe` (126%, charging; the right bud was at 50%), or two bytes `94 94` (20% charging twice; both buds were at 65%) ([capture](docs/captures/redmi-buds-5-fastpair.txt)) |
+| `0000fd2d-0000-1000-8000-00805f9b34fb` | Xiaomi's 16-bit service | **Yes: RCSP, below** |
+| `00001101-0000-1000-8000-00805f9b34fb` | standard SPP | not tried |
+| `66666666-6666-6666-6666-666666666666`, `99999999-9999-9999-9999-999999999999` | vendor | not tried |
+| `00001100-d102-11e1-9b23-00025b00a5a5` | CSR GAIA | **absent**: this is not a Buds 5 Pro |
+
+BlueZ alone gives one figure for the pair (HFP), and the Fast Pair stream gives
+none that can be used: its battery frame was absent, then one byte above 100,
+then two bytes the reader does not read. The reader treats a byte whose level
+is above 100 as no reading, as the Fast Pair spec's 0–100 (`0x7F` unknown)
+implies. This is why the device has a bridge for its battery as well as for its
+noise control. The widget picks the backend from the reported name
+(`Redmi Buds 5`) and the `0000fd2d` UUID together, like TOZO and Huawei; the
+UUID alone is not a claim, since other Xiaomi products advertise it.
+
+The channel is opened the way Sony's is: a Profile1 for the UUID, `Role`
+`client`, `Channel` `0`, `AutoConnect` false, asynchronous `ConnectProfile`.
+BlueZ allows one registration per UUID, so the bridge, the probe and the
+phone's Xiaomi Earbuds app cannot hold the channel at once.
+
+### Frames
+
+RCSP, the framing the Jieli SDKs use:
+
+```
+FE DC BA <flags> <opcode> <len u16be> <body> EF
+```
+
+`flags` is `0x80` for a command and `0x40` when it wants a response; the earbuds'
+own announcements carry `0xC7`, a target-app field in the low bits. A command's
+body is `<sn> <param>`; a response's is `<status> <sn> <payload>`, status `00`
+being success. The sequence number is the one in the command.
+
+### The battery
+
+```
+->  fe dc ba c0 02 00 05 01 ff ff ff ff ef             GetTargetInfo, every attribute
+<-  fe dc ba 00 02 00 2c 00 01 05 01 10 38 10 38 05 03 27 17 50 6a 02 04 01
+    02 05 00 03 06 10 38 04 07 4b 50 64 02 08 02 02 09 00 02 0c 00 02 0d 02
+    02 0e 00 ef
+```
+
+The payload is `<length> <type> <value>` attributes, length counting the type.
+Type `7` is the batteries, one byte each for **left, right, case**: `4b 50 64`
+is 75, 80, 100, and the Xiaomi Earbuds app showed L 75, R 80, case 100. The
+other attributes are not read (`3` carries `27 17` and `50 6a`, which read as a
+vendor and a product id).
+
+The low seven bits are the level and every level seen was a multiple of five.
+Bit 7 is read as charging and `0xFF` as no reading, which is how the app reads
+the byte; no earbud was charging or out of range in the capture, so neither is
+confirmed here. The earbuds were not heard to announce a battery change on their
+own, so the bridge asks again every 30 s.
+
+### The noise control
+
+Config `11` is the noise control, two bytes, `<state> <level>`: state `0` off,
+`1` cancelling, `2` transparency. A config is `<len> <id u16be> <value>`, `len`
+counting the id and the value.
+
+```
+->  fe dc ba c0 f3 00 03 01 00 0b ef                    GetDeviceConfig 11
+<-  fe dc ba 00 f3 00 07 00 01 04 00 0b 02 00 ef        transparency, level 0
+->  fe dc ba c0 f2 00 06 04 04 00 0b 01 00 ef           SetDeviceConfig 11: cancelling
+<-  fe dc ba c7 0e 00 04 04 02 04 01 ef                  status report (the earbuds' own)
+    fe dc ba c7 f4 00 06 05 04 00 0b 01 00 ef           the config, announced
+    fe dc ba 00 f2 00 02 00 04 ef                       acknowledged, status 0
+```
+
+A set was acknowledged, announced and then read back the same on all four sets
+tried (transparency to itself, to cancelling, to off, and back). The three
+frames after a set arrive together, and the announcement also follows a change
+made on the earbuds. Nothing was answered to them. The second byte, the
+strength inside a state, was `0` in every state the earbuds were left in; the
+bridge sends the one a state was last seen at, or `0`.
+
+Not tried: the strengths of cancelling and transparency the app offers, the
+other configs (adaptive noise, the touch controls, the equaliser), wear
+detection, and what an earbud does while charging.
+
+### In the widget
+
+[`redmi-bridge`](redmi-bridge) follows [`BRIDGE.md`](BRIDGE.md): the Classic
+address, the JSON line, stdin `set <mode>`, the four exit codes. It prints the
+mode once the earbuds have said it, with the batteries.
+
+```json
+{"modes": true, "mode": "anc", "available": ["off","anc","ambient"],
+ "battery": {"left": 75, "right": 80, "case": 100, "charging": []}}
+```
+
+The panel calls the second mode *Transparency*, as the Xiaomi Earbuds app does
+(`modeLabels` in the `redmi` row). The Fast Pair stream, which is up but empty,
+does not shadow the bridge's battery for this backend.
+
+### The probe
+
+[`tools/redmi_probe.py`](tools/redmi_probe.py):
+
+```bash
+tools/redmi_probe.py AA:BB:CC:00:00:01                       # read the mode and battery
+tools/redmi_probe.py AA:BB:CC:00:00:01 --cycle off,anc,ambient
+```
+
+It reads by default. `--cycle` writes only when the initial mode is known,
+checks each set against what the earbuds report, and puts the initial mode back
+on every way out, saying `RESTORE FAILED` and exiting 2 if it cannot. Mode
+changes are audible. Turn `useModeControl` off first: the bridge holds the
+channel.
+
+### Redmi Buds 3 Pro — the same frames, behind an authentication
+
+Confirmed on **Redmi Buds 3 Pro** (firmware `1.1.1.1` as GetTargetInfo's
+attribute 1 reads; Airoha, Modalias vendor `0x0094`) by
+[@osteotek](https://github.com/osteotek). The capture is
+[`docs/captures/redmi-buds-3-pro.txt`](docs/captures/redmi-buds-3-pro.txt),
+the SDP record
+[`docs/captures/redmi-buds-3-pro-bluetoothctl.txt`](docs/captures/redmi-buds-3-pro-bluetoothctl.txt).
+Their record has `0000fd2d` and no Fast Pair Message Stream, no SPP; BlueZ
+gives one figure for the pair.
+
+The channel opens the same way as the Buds 5's, and the Buds 5's two reads go
+unanswered: the earbuds say nothing at all until a mutual authentication is
+done. The handshake was first described by Gadgetbridge's Redmi Buds support,
+which lists this model; every frame below is one these earbuds sent or
+accepted.
+
+```
+->  fe dc ba c4 50 00 12 01 01 <16-byte challenge> ef            ours
+<-  fe dc ba 04 50 00 13 00 01 01 <16-byte response> ef           checked
+->  fe dc ba c4 51 00 03 02 01 00 ef                              our confirmation
+<-  fe dc ba 04 51 00 03 00 02 01 ef
+<-  fe dc ba c0 50 00 12 00 01 <16-byte challenge> ef            theirs
+->  fe dc ba 04 50 00 13 00 00 01 <16-byte response> ef
+<-  fe dc ba c0 51 00 03 01 01 00 ef                              their confirmation
+->  fe dc ba 04 51 00 03 00 01 01 ef
+```
+
+A response is SAFER+ in Bluetooth's `Ar'` form (the E1 block cipher, eight
+rounds, the input added again before the third) keyed by the challenge with
+its last byte XOR `06`, over the fixed block `11 22 33 33 22 11 11 22 33 33 22
+11 11 22 33 33`. Computed that way, the response to our challenge matched the
+earbuds' own in every session captured, and the earbuds went on after ours.
+A flags byte with `0x04` set (`c4`, `04`) is what was sent for the handshake;
+whether `c0` / `00` would also do was not tried.
+
+After it the conversation is the Buds 5's, byte for byte: GetDeviceConfig 11
+is answered `04 00 0b <state> <level>`, SetDeviceConfig 11 is acknowledged and
+announced as `F4`, and GetTargetInfo carries the batteries as attribute 7:
+
+```
+<-  fe dc ba 00 02 00 38 00 04 11 00 52 65 64 6d 69 20 42 75 64 73 20 33 20 50 72 6f
+    05 01 11 11 11 11 02 02 5e 05 03 5a 4d ea 0b 02 04 01 02 05 00 03 06 11 11 02 08 01
+    04 07 5e 5e 2c 02 0d 02 ef                      "Redmi Buds 3 Pro", 94, 94, 44
+```
+
+Off, cancelling and transparency were each set, announced and read back; a
+long press on a stem was announced the same way (cancelling, then
+transparency).
+
+**Announcements are repeated until answered.** The earbuds' own frames, the
+status report `0E` and the config announcement `F4`, came back every two
+seconds while nothing answered them, so a mode announced earlier arrived after
+a later one (the capture's second run, where it was taken for the mode the
+earbuds were in). Each is answered with an empty response carrying its sn,
+`fe dc ba 04 <opcode> 00 02 00 <sn> ef`, as Gadgetbridge does; after that
+none was heard twice.
+
+**The status report carries the batteries.** Its body is `<length> <type>
+<value>` attributes, and type `0` is the three battery bytes in GetTargetInfo's
+layout. The earbuds sent one on their own as a level fell, and as the left bud
+went into the case with the lid open: `ff ff ff` (no reading), then
+`dc 5c 2c`, left 92 and charging, which confirms bit 7 as charging on this
+model. Type `4` is the noise state, which the `F4` announcement also carries.
+Config `12`, announced with each move into or out of the case (`0c`, `04`,
+`06`), is not read.
+
+[`redmi-bridge`](redmi-bridge) is started with the reported name for this
+model (its own `BACKENDS` row, `redmi-buds-3-pro`; the Buds 5's row passes no
+name and is unchanged). The `MODELS` row turns on the handshake, the answers
+to announcements and the battery from status reports; the rest is the Buds 5's
+code. The probe takes the name the same way:
+
+```bash
+tools/redmi_probe.py --name "Redmi Buds 3 Pro" AA:BB:CC:00:00:03
+tools/redmi_probe.py --name "Redmi Buds 3 Pro" AA:BB:CC:00:00:03 --cycle off,anc,ambient
+```
+
+Not tried on these earbuds: the strengths inside cancelling and transparency,
+adaptive cancelling, wear detection, the touch-control and equaliser configs,
+the case's own charging, and the phone's Xiaomi Earbuds app holding the channel
+at the same time.
+
+## EarFun Air Pro 4 — GAIA-shaped frames on SPP
+
+Confirmed on an **EarFun Air Pro 4** (firmware `TW600-3091_20250919_v0.4.1`, as
+the earbuds report it) on BlueZ 5.87. The
+command numbers are the ones Gadgetbridge's EarFun support uses; only the ones
+below were sent, and every one of them was answered. The capture is
+[`docs/captures/earfun-air-pro-4.txt`](docs/captures/earfun-air-pro-4.txt), the
+SDP record
+[`docs/captures/earfun-air-pro-4-bluetoothctl.txt`](docs/captures/earfun-air-pro-4-bluetoothctl.txt).
+
+`bluetoothctl info` lists, among the standard audio profiles:
+
+| UUID | What it is | Answers? |
+|---|---|---|
+| `df21fe2c-2515-4fdb-8886-f12c4d67927c` | Fast Pair Message Stream | **Yes — battery: left, right, case**, model id `f3d9b4`, and a BLE address |
+| `00001101-0000-1000-8000-00805f9b34fb` | standard SPP | **Yes: the frames below** |
+| `0000eb04-d102-11e1-9b23-00025b00a5a5` … `0000eb07-…` | vendor | not tried |
+| `00001100-d102-11e1-9b23-00025b00a5a5` | CSR GAIA | **absent**: the `xiaomi` row does not claim these earbuds |
+
+The widget picks the backend from the reported name (`EarFun Air Pro 4`) and
+SPP together, like TOZO, Huawei and Redmi: plain SPP is on most headsets here,
+and the `eb04`–`eb07` vendor UUIDs were not the channel. The row sits before
+JBL's because the Fast Pair stream announces a BLE address, which alone hands a
+device to the JBL bridge. The channel is opened with a Profile1 for SPP,
+`Role` `client`, asynchronous `ConnectProfile`.
+
+### Frames
+
+```
+FF <version> <flags> <len u8> <vendor u16be> <command u16be> <payload>
+```
+
+No checksum. Sent with version `04`, answered with version `03`, flags `00`
+and vendor `000A` both ways. An answer carries the command with bit `0x8000`
+set, and the payload `<status> <value>`; status `00` was the only one seen.
+The earbuds also send frames unasked (commands `034D`, `0350`, `0358`, without
+the ack bit), often several in one read. They are not read.
+
+### The noise control
+
+```
+->  ff 04 00 00 00 0a 03 15              get
+<-  ff 03 00 02 00 0a 83 15 00 00        off           (01 cancelling, 02 transparency)
+->  ff 04 00 01 00 0a 03 14 01           set: cancelling
+                                         (nothing comes back)
+```
+
+A set is answered by nothing: no acknowledgement and no announcement. The get
+keeps answering the old value until the change is done, 0.7 to 2.1 s after the
+set in the capture, and a get sent during the change is answered late. A set
+sent right after another change is not lost, only slow. All three values were
+set and read back; the earbuds were put back in off.
+
+The strength inside a state is a separate setting (get `033B`, the ANC style,
+answered `02`; get `033D`, the transparency style, answered `00`). A set of
+`0314` leaves it where it was. The bridge reads and writes neither.
+
+Touch and hold on a stem did not change the noise control on this pair (touch is
+enabled: get `0335` answered `00`), and nothing about the mode was sent unasked
+in a minute of listening. So a change made outside the bridge was never seen
+announced, and the bridge asks for the mode again every 10 s.
+
+### The battery
+
+Fast Pair, as for JBL:
+
+```
+<-  03 03 00 03 64 64 5a                 left 100, right 100, case 90
+```
+
+The same numbers came back on SPP (gets `0306`, `0307`, `0317`), which the
+bridge does not use. No charging byte and no "no reading" byte was captured.
+
+Not tried: the eb04–eb07 channels, the ANC and transparency styles as
+settings, the equaliser, the touch assignments, wear detection, and what the
+earbuds say while charging.
+
+### In the widget
+
+[`earfun-bridge`](earfun-bridge) follows [`BRIDGE.md`](BRIDGE.md): the Classic
+address and the reported name (which picks its row in `MODELS`), the JSON line,
+stdin `set <mode>`, the four exit codes. A name with no row is exit 4.
+
+```json
+{"modes": true, "mode": "anc", "available": ["off","anc","ambient"]}
+```
+
+After a set it asks every second, five times at most, until the earbuds report
+the mode that was set; the line changes only when they do.
+
+Owner live check, through the running plugin's IPC on commit `cc0c10e`
+([`docs/captures/earfun-air-pro-4-live.json`](docs/captures/earfun-air-pro-4-live.json)):
+from off, ANC, Ambient, Off and ANC were each set and reported back by the
+earbuds in 1.9 to 2.7 s; `talkthru` was refused as unavailable; Fast Pair gave
+left 90, right 100, case 90; the mode held across a Fast Pair refresh; after a
+Bluetooth disconnect the bridge exited and the panel said not connected, and
+after the reconnect a new bridge reported ANC again in 6.9 s and took a set to
+Ambient; off was restored and read back. Not checked live: charging, a bud in
+the case, the earbuds' own touch control (it did not change the mode, above),
+another pair connected at the same time, and how the modes sound.
+
+### The probe
+
+[`tools/earfun_probe.py`](tools/earfun_probe.py):
+
+```bash
+tools/earfun_probe.py AA:BB:CC:00:00:02                       # read the firmware and the mode
+tools/earfun_probe.py AA:BB:CC:00:00:02 --cycle anc,ambient,off
+```
+
+It reads by default. `--cycle` writes only when the initial mode is known,
+checks each set by asking until the earbuds agree, and puts the initial mode
+back on every way out, saying `RESTORE FAILED` and exiting 2 if it cannot.
+Mode changes are audible. Turn `useModeControl` off first: the bridge holds
+the channel.
+
+## Nothing NT Link — the Nothing X protocol on RFCOMM (channel 15, or 28)
+
+A fourth channel, and the first one read from other people's work rather than
+off a headset on this desk. What follows is what three clients agree on —
+[r-witz/omarchy-nothing-ear](https://github.com/r-witz/omarchy-nothing-ear)
+(Nothing Ear and Headphone (1), the bridge's battery and latency handling is
+theirs), [DaanHessen/earctl](https://github.com/DaanHessen/earctl) (the command
+table, many models), and the Ear (a) trace that came with
+[pull request #2](https://github.com/ncr/omarchy-headphones/pull/2) by
+[@Jenesaispas69](https://github.com/Jenesaispas69), who ran it on the
+hardware (the SDP UUID, the frame layout confirmed on the wire, the gallery
+screenshot). Where the three differ, both readings are handled below.
+
+```
+aeac4a03-dff5-498f-843a-34487cf133eb   NT Link   <- Ear (a) on channel 15; the Ear (2), Ear,
+                                                    Ear (stick) and Headphone (1) speak the same
+                                                    protocol, CMF Headphone Pro on 28, and
+                                                    CMF Buds 2 on 16
+```
+
+**Opening it.** The bridge opens an `AF_BLUETOOTH` / `BTPROTO_RFCOMM`
+socket directly. Its optional second argument is the name reported by the
+headset, already available to the follower. `MODELS` selects the channel
+before any connect: known legacy Nothing models retain 15 on every retry;
+CMF Headphone Pro uses 28, and CMF Buds 2 uses 16. An unknown name gets `(15, 28)` discovery, while
+an absent name retains the old channel-15-only call. Matching ignores case,
+outer whitespace and the optional Nothing brand prefix; it does not use a
+user's renamed Alias when the reported name is available.
+
+A refused connection does not change a known model's channel. The first
+connect after pairing or reconnecting is often refused; the existing six
+attempts and 1.5-second retry delay remain. The Ear (a) trace went through
+`org.bluez.Profile1` with the UUID and `Channel: 15` instead and landed on the
+same socket.
+
+**Activation.** Nothing X asks for device info (`06`) first, and r-witz found
+that a fresh session may ignore what follows until it has been asked. The bridge
+sends it first and waits up to a second and a half for the answer before the real
+queries go out; the answer itself is not used.
+
+### Frames
+
+```
+55 60 01 <cmd u16 LE> <len u16 LE> <op u8> <payload…> <crc u16 LE>
+^^ ^^^^^
+|  ctrl 0x0160: bit 0x20 says a CRC follows the payload
+SOF
+```
+
+| field | size | meaning |
+|---|---|---|
+| SOF | 1 | `55` |
+| ctrl | 2 | `0160` LE. Bit `0x20` — set on everything seen — means a CRC is appended |
+| cmd | 2 | LE. Low byte the command, high byte the direction: `C0` get, `F0` set, `40` answer, `70` ack, `E0` unsolicited |
+| len | 2 | payload length, LE (the Ear (a) trace read it as `<len u8> 00`, which is the same bytes) |
+| op | 1 | an operation id, echoed in the answer; the bridge always sends 1 |
+| payload | len | command-specific |
+| crc | 2 | CRC-16/MODBUS (init `FFFF`, poly `A001`, check value `4B37`) over every byte before it, LE |
+
+So `55 60 01 1E C0 00 00 01 B1 1D` asks for the noise-control state.
+
+### Commands
+
+| command | get | answer | set | notes |
+|---|---|---|---|---|
+| device info | `C0 06` | `40 06` | — | asked first, see Activation |
+| battery | `C0 07` | `40 07`, and `E0 01` unsolicited | — | |
+| noise control | `C0 1E` | `40 1E`, and `E0 03` unsolicited | `F0 0F` | |
+| low latency | `C0 41` | `40 41` | `F0 40` | absent on models without it: the get goes unanswered |
+| codec flag | `C0 29` | `40 29` | — | the device's own idea of its codec mode; read-only, see below |
+
+**Battery** answers with a count byte and then `<component> <level>` pairs.
+Bit 7 of the level is charging, the low seven bits the percentage:
+
+| component | |
+|---|---|
+| `02` | left earbud |
+| `03` | right earbud |
+| `04` | case — present only while the case is open |
+| `06` | the one battery of a Headphone (1) |
+
+`03 02 55 03 0F 04 55` is left 85%, right 15%, case 85%, nothing charging.
+
+**Noise control** answers with `01 <mode> 00`; the set payload is the same
+three bytes. The mode byte:
+
+| value | Nothing X calls it | the widget calls it |
+|---|---|---|
+| `01` | Noise Cancelling, High | `anc`, level `high` |
+| `02` | Noise Cancelling, Mid | `anc`, level `mid` |
+| `03` | Noise Cancelling, Low | `anc`, level `low` |
+| `04` | Noise Cancelling, Adaptive | `anc`, level `adaptive` |
+| `05` | Off | `off` |
+| `07` | Transparency | `ambient` |
+
+r-witz's client reads the payload as `(kind, value, 0)` triplets, with kind `1`
+carrying the mode and an optional kind `2` carrying a strength `1`–`4` on its
+own; earctl and the Ear (a) trace read the mode byte alone. The bridge reads
+`payload[1]` as the mode and lets a `02 <level>` triplet, where one follows,
+override the strength — so either firmware is read the same way.
+
+A set is answered with an ack (`70 0F`), not with the new state; the Ear (a)
+trace saw the `E0 03` announcement follow it. The bridge asks again half a
+second after every set rather than trusting either. Touch controls on the
+earbuds are not reliably announced on this channel, so the mode is polled every
+three seconds and the battery every fifth poll.
+
+**Low latency**: the answer's first byte is `01` for on; the set payload is
+`01` for on and `02` for off.
+
+**The codec flag** (`29`) is the device's own codec mode — `00` standard, `01`
+LHDC, `02` LDAC. r-witz reports it and deliberately never writes it: the
+firmware acknowledges a value without applying it, and the codec actually used
+is whatever the host negotiated. The widget leaves it alone.
+
+### In the widget
+
+[`nothing-bridge`](nothing-bridge) holds the socket and writes the same lines
+the other bridges do, in the panel's vocabulary — Transparency is `ambient`,
+the four strengths are `anc` with an `ancLevel`:
+
+```json
+{"modes": true, "mode": "anc", "available": ["off","anc","ambient"],
+ "ancLevel": "high", "ancLevels": ["low","mid","high","adaptive"],
+ "latency": false,
+ "battery": {"left": 85, "right": 15, "case": 85, "charging": [], "caseStale": false}}
+```
+
+Commands on stdin: `set off|anc|ambient`, `level low|mid|high|adaptive`,
+`latency on|off`. `set anc` asks for the strength last seen (Adaptive when none
+has been), because the device stores the strength with the mode and has no
+plain "on".
+
+The battery is a fallback: the Fast Pair stream, where the device serves one,
+announces a change the moment it happens and wins while it is up. The case only
+reports while open, so the bridge keeps its last reading — on disk, six hours —
+and sends it as `caseStale`, which the panel dims.
+
+Exit codes match the other bridges: 0 clean, 1 transient (the socket refused or
+closed), 3 silent (open, but the noise-control query went unanswered), 4 setup.
+
+### CMF Headphone Pro — RFCOMM channel 28
+
+Read off the hardware by [@adilahmad17](https://github.com/adilahmad17), one
+continuous session on 28 (channel 15 is refused): the initial read, every mode
+and ANC level and the low-latency switch, each set followed by a read-back, then
+a restore. Capture: [`docs/captures/nothing-headphone-pro.txt`](docs/captures/nothing-headphone-pro.txt),
+SDP record: [`docs/captures/nothing-headphone-pro-bluetoothctl.txt`](docs/captures/nothing-headphone-pro-bluetoothctl.txt).
+It is the same protocol as the earbuds, frame for frame; what is model-specific:
+
+- **Channel 28**, not 15. The SDP record still carries only the NT Link UUID —
+  there is no separate UUID for the headphone. The reported name selects its
+  channel-28 row; the shared UUID still selects the Nothing backend.
+- **Device info** (`40 06`) is ASCII lines, `<kind>,<index>,<value>` separated
+  by `0a`: `6,1,1.0.0.2` / `6,2,1.0.1.44` (firmware), `6,4,<serial>`,
+  `6,6,<mac>`. The bridge does not read it; it only unlocks the real queries.
+- **Battery** (`40 07`) is a single pair, component `06` — `01 06 0f` is the
+  one headset battery at 15%. No `02`/`03`/`04`, as expected for an over-ear
+  set; the case components never appear.
+- **Noise control** answers and events are the six-byte triplet form
+  `01 <mode> 00 02 <level> 00` — r-witz's `(kind, value, 0)` reading, not the
+  bare `01 <mode> 00`. Every value in the table above was seen: `05` off,
+  `07` transparency, and `01`–`04` for High / Mid / Low / Adaptive, each in
+  both the `40 1E` read-back and an `E0 03` announcement. Setting a numbered
+  strength moves the `02 <level>` byte with the mode byte; setting `off` or
+  `ambient` leaves the last strength in the `02` slot. Set payloads are the
+  bridge's existing `01 <byte> 00`.
+- **Low latency** (`C0 41`): `40 41` payload `01` on, `02` off (an unset device
+  answered `00`, read as off). Set `F0 40` payload `01` on / `02` off. Confirmed
+  both ways.
+- **Ack**: `70 0F` for a noise-control set, `70 40` for a low-latency set — no
+  payload, the read-back carries the new state.
+- **`E0 01`** battery announcements arrive unprompted every few seconds; **`E0 03`**
+  follows every mode change, the device's own and the widget's alike.
+- Two frames are seen and not parsed: **`E0 19`** (`55 00 03 19 e0 …`), a short
+  event that arrives once at session start, and a **`09`** frame on ctrl
+  `0x0660` with a direction byte of `7c`. Neither is a get/answer/ack the
+  bridge asked for; both are ignored. They are recorded here because they were
+  on the wire, not because their meaning is known.
+- Some events use ctrl `0x0300` (`55 00 03 …`), where bit `0x20` is clear and
+  **no CRC follows**; the framer already keys the trailer off that bit, so both
+  forms parse.
+- The `29` codec flag answered `00` and is left alone, as on the earbuds.
+
+### CMF Buds 2 — RFCOMM channel 16
+
+Read off hardware (`3C:B0:ED:D0:AC:0B`).
+Channels 15 and 28 are refused; channel 16 connects and speaks the Nothing NT Link protocol.
+- **Channel 16**. The SDP record advertises the shared NT Link UUID (`aeac4a03-dff5-498f-843a-34487cf133eb`). The reported name `CMF Buds 2` selects channel 16.
+- **Device info** (`40 06`): ASCII lines returning firmware version (`1.0.1.52`), unlocking queries.
+- **Battery** (`40 07` / `E0 01`): query `40 07` answers left and right components (`02 02 64 03 64`). While the case is opened, unsolicited `E0 01` announcements arrive including component `04` (case battery, e.g. `03 02 64 03 64 04 55` -> case 85%). When the case is closed, subsequent queries omit component `04`, and `nothing-bridge` retains the cached case level with `caseStale: true`.
+- **Noise control** (`40 1E` / `E0 03`): six-byte triplet form `01 <mode> 00 02 <level> 00`. Confirmed for all options: Off (`05`), Ambient/Transparency (`07`), and ANC (`01`–`04`) with levels Low (`03`), Mid (`02`), High (`01`), and Adaptive (`04`). Setting each mode produces an ACK (`70 0F`), an unsolicited `E0 03` state event, and is verified on read-back.
+- **Low latency** (`C0 41` / `40 41`): `01` on, `02` off. Setting `F0 40` payload `01` on / `02` off produces an ACK (`70 40`), an unsolicited `40 41` answer (header `55 20`, sequence `00`), and is verified on read-back.
+- **Reconnect & mode-control**: turning `useModeControl` off terminates `nothing-bridge` and frees RFCOMM channel 16; turning it on reconnects within ~2 seconds and restores state. Bridge process termination triggers clean recovery and reconnect in `DeviceFollower.qml`.
+- **Unavailable & untested**: continuous ambient dial (`ambientLevel` unsupported, discrete mode only), in-ear wear detection (`worn` unsupported on this channel), charging state bits (buds were 100%), multipoint dual-connection isolation, and acoustic tuning remain unobserved/untested on hardware.
+
+### The probe
+
+[`tools/nothing_probe.py`](tools/nothing_probe.py) — opens the socket, sends
+the four gets, prints every frame in both directions decoded, and optionally
+writes one setting afterwards:
+
+```bash
+tools/nothing_probe.py 3C:B0:ED:AF:7C:30
+tools/nothing_probe.py 3C:B0:ED:AF:7C:30 set-anc high
+tools/nothing_probe.py 3C:B0:ED:AF:7C:30 set-latency on
+```
+
+The probe defaults to channel 15 to preserve existing calls. Select 16 or 28
+explicitly for CMF models (the bridge itself selects by reported model name):
+
+```bash
+tools/nothing_probe.py --channel 16 3C:B0:ED:D0:AC:0B
+tools/nothing_probe.py --channel 28 2C:BE:EE:3C:6F:FE
+```
+
+The widget's bridge holds that same channel, so turn `useModeControl` off
+before probing; a second RFCOMM client is refused while the first is up.
+
+
+## Soundcore Space 2 — vendor RFCOMM
+
+Notes from probing a **Soundcore Space 2** (`84:9D:4B:B0:2D:00`, modalias
+`bluetooth:v02B0p0000d001F`).
+
+Like Sony and Xiaomi, its listening mode is over an RFCOMM channel. Soundcore devices
+advertise a vendor UUID starting with `0cf12d31-fac3-4553-bd80-d6832e7...`
+(`0cf12d31-fac3-4553-bd80-d6832e7d1402` on the Space 2, where `d1402` is the model ID).
+Connecting an `org.bluez.Profile1` to this UUID opens the RFCOMM control link.
+
+### Framing
+
+```
+outbound:  08 ee 00 00 00 <cmd u8, u8> <len u16le> <payload> <checksum u8>
+inbound:   09 ff 00 00 01 <cmd u8, u8> <len u16le> <payload> <checksum u8>
+```
+
+- `<len u16le>` is the little-endian total byte length of the packet (including header, command, length, payload, and checksum).
+- `<checksum u8>` is the simple 8-bit sum (`sum(packet[:-1]) & 0xFF`).
+
+### Commands
+
+| Command | Direction | Meaning |
+|---|---|---|
+| `01 01` | Outbound | `RequestState`: ask for full initial state |
+| `01 01` | Inbound | `StateUpdate`: 103-byte payload (113-byte packet), sound modes at offset 71..77 |
+| `06 81` | Outbound | `SetSoundModes`: 6-byte payload `[mode, custom_anc, transparency_mode, nc_mode, wind_noise, custom_transparency]` |
+| `06 81` | Inbound | ACK from headphones |
+| `06 01` | Inbound | `SoundModes` notification when mode changes |
+
+### Sound mode byte
+
+- `0x00` — ANC
+- `0x01` — Ambient
+- `0x02` — Off (Normal)
+
+A mode change is confirmed on the headphones immediately and answered with both an ACK (`06 81`) and an unsolicited notification (`06 01`).
+
+### The probe
+
+[`tools/soundcore_probe.py`](tools/soundcore_probe.py):
+
+```bash
+tools/soundcore_probe.py 84:9D:4B:B0:2D:00
+tools/soundcore_probe.py 84:9D:4B:B0:2D:00 5 set:ambient
+```
+
+It asks for the state (`01 01`) and the sound modes (`06 01`) and prints both.
+A `set:` writes the device's own sound-mode bytes back with only the mode
+replaced — the `06 01` reply, as wide as it came up to six bytes — then asks
+both questions again. A device that did not answer `06 01` is not written to,
+except the Space 2, whose block is known to sit at offset 71 of its state.
+Until 1.3.8 the probe sent a fixed `1f ff 00 00 01` after the mode, which is
+what overwrote two fields on the Life Q30 below.
+
+
+
+### Space One Pro (A3062) — the same protocol, six bytes further left
+
+Notes from a **soundcore Space One Pro** (`7C:E9:13:2C:2B:6D`, firmware
+`0.4.3.9`). Same vendor channel as the Space 2, same framing, same commands.
+One thing differs, and it is enough to break both reading and writing.
+
+#### The block moves
+
+`0cf12d31-fac3-4553-bd80-d6832e7b3062`, model ID `b3062` in the usual place, and
+`01 01` answers with a 95-byte state. The six sound mode bytes are **at offset
+69, not 71**:
+
+```
+... 04 04 0f 03 02 05 31 01 31 01 31 01 00 00 01 ...
+          ^^ ^^ ^^^^^^^^^^^^^^^^^ the block, at 69
+          |  ambient sound mode cycle
+          press twice
+```
+
+Two bytes to the left of where the Space 2 keeps it. Which field accounts for
+the difference I have not established — there is no Space 2 here to compare
+against — but 69 is not a guess about this one headset. It falls out of
+[OpenSCQ30](https://github.com/Oppzippy/OpenSCQ30)'s A3062 parser, which reads
+the packet field by field, and every field ahead of the sound modes has a fixed
+width:
+
+```
+  0..1   battery              23..34  equalizer configuration
+  2..6   firmware version     35..36  unknown
+  7..22  serial number        37..64  custom hear id, music genre at the end
+                              65..66  unknown
+                              67      button configuration
+                              68      ambient sound mode cycle
+                              69      sound modes  <-
+```
+
+That layout was derived independently, from a different unit, and it lands on
+the same six bytes this one reports. A firmware that moved them would have to
+change one of those widths, and would break OpenSCQ30 in the same breath.
+
+Read at 71 the mode comes out as `0x31`, which is no mode at all, and the row
+stays on **pending** forever:
+
+```
+$ tools/soundcore_probe.py 7C:E9:13:2C:2B:6D 20
+<<< STATE: mode=unknown(49) params=310131013101
+```
+
+The quieter half of the same bug is the write. `set` takes
+`sound_mode_params`, replaces byte 0 and sends the rest back — so with the
+offset wrong it posts five of the device's neighbouring settings as if they were
+the mode parameters. On this headset that overwrote the custom noise cancelling
+and custom transparency levels with `31 01 31 01`, which is not a value anyone
+chose.
+
+#### Ask 06 01 and no offset is needed
+
+`06 01` answers with the six bytes and nothing around them — on this model;
+whether the Space 2 answers a request is untested, it has only been seen to emit
+one unprompted:
+
+```
+>>> 08 ee 00 00 00 06 01 0a 00 07
+<<< 08 ee 00 00 00 06 01 10 00 02 50 01 01 00 05 ...
+                              ^^^^^^^^^^^^^^^^^ exactly body[69:75] above
+```
+
+`on_packet` already reads that reply correctly. It was simply never asked for —
+the handshake sends `01 01` and waits. Asking as well costs one 10-byte frame at
+connect and cannot drift as firmware moves fields about.
+
+Worth saying why the offset is not simply checked instead. The obvious guard is
+to take the byte at 71 only when it looks like a mode and ask `06 01` otherwise,
+and it does not work: the neighbours are switches, so the byte at 71 reads as a
+perfectly plausible `0`, `1` or `2` most of the time. On this headset with the
+mode on Ambient it is `01`, and a guard like that reports Ambient for the wrong
+reason and then writes the wrong five bytes back, exactly as before. Tried, and
+it took a second round of overwritten levels to notice.
+
+So the query goes out after the state packet, and its reply stands over
+whatever the offset produced. Which models are asked is a row in `MODELS` at the
+top of `soundcore-bridge`: the Space One Pro, and any model the bridge has not
+seen. The Space 2's row says not to — its owner has not confirmed a request is
+answered, and a headset that works is not sent a frame it has never been seen
+to take. `tests/soundcore_bridge_test.py` pins each row's frames, so the next
+model cannot change what an earlier one is sent without failing there.
+
+#### And ask again after a set
+
+The Space 2 answers a set with an ACK **and** an unsolicited `06 01`, which is
+what carries the row along. The Space One Pro sends the ACK alone. The write
+lands — reading back over the vendor channel confirms it, tail intact:
+
+```
+$ omarchy-shell cornerstone-phones setMode anc
+ok
+<<< 06 01 body=00 50 01 01 00 05        mode 0, and the five neighbours untouched
+```
+
+— but nothing arrives to say so, so the panel goes on showing the mode the
+headphones were in a moment ago. One `06 01` after each write settles it.
+
+#### A caution about the vendor channel going missing
+
+Worth writing down because it cost an afternoon. After several hours connected,
+and an auto power off in the middle, `ConnectProfile` began refusing the vendor
+UUID outright:
+
+```
+09:38:40.594 ConnectProfile: br-connection-not-supported
+...eleven times, once per retry...
+```
+
+[OpenSCQ30](https://github.com/Oppzippy/OpenSCQ30) v2.11.0 failed identically at
+the same call, and a scan of RFCOMM channels 1-30 found only HFP, the Message
+Stream, and two channels that accept a socket and answer nothing. It reads
+exactly like a device that does not serve the channel.
+
+**It is transient.** Power cycling the headphones brought it straight back, and
+it has been reliable since. `EXIT_TRANSIENT` and the growing backoff are the
+right answer; anything that parks the address on that error would leave the row
+disabled until the shell restarts, at the very moment a power cycle would have
+fixed it.
+
+In that state the control protocol is also reachable over BLE GATT, on the
+rotating Fast Pair address — service `0179f5da-0000-1000-8000-00805f9b34fb`,
+write handle `0x001a`, notify handle `0x0016`, requests keeping the `08 ee`
+header and replies using `09 ff 00 00 01`. `06 01` works there too and returns
+the same six bytes; `06 81` is acknowledged and reads back changed. Recorded in
+case it is ever the only way in, though on a healthy device the vendor channel
+is simpler and this plugin needs nothing from it. Two notes for anyone who
+tries: the address rotates and arrives unprompted as `0b 02` on the same notify
+handle, and BlueZ drops the LE link the moment no client holds it.
+
+### Life Q30 (A3028) — the same protocol, four bytes at 35
+
+Notes from a **soundcore Q30** (`88:0E:85:5F:64:B4`, firmware `05.24`, serial
+starting `3028`). Same vendor channel as the Space 2, same framing, same
+commands, same mode bytes. Two things differ, and between them the row never
+said anything at all.
+
+#### A shorter state, and the block near its front
+
+`0cf12d31-fac3-4553-bd80-d6832e7b302a`, model ID `b302a`, and `01 01` answers
+with a **70-byte** state — a third of the Space 2's. The sound mode bytes are at
+**offset 35**:
+
+```
+0200 fefe9d93949faa8d8f78 0000...0000 01 00 01 00 00 30352e32343330 3238...
+                                         ^^^^^^^^^^^ the block, at 35
+                                      ^^ ambient sound mode cycle
+                                                     ^^^^^^^^^^^^^ "05.24" — firmware,
+                                                                   as ASCII, from 39
+```
+
+Read at 71 there is no byte at all: the payload ends at 69. `on_packet` needs
+`len(body) >= offset + 4` before it reads anything, so the state was discarded,
+`06 01` was never asked for on the UNKNOWN row's terms, and the bridge sat
+connected and silent until the service parked the address. From outside, the
+headphones showed a battery and no controls.
+
+#### The block is four bytes wide, and what follows is not mode data
+
+This is the part that matters beyond this one headset. The Space 2's block is
+six bytes and the bridge reads six. Here the fourth byte is the last:
+
+```
+>>> 08 ee 00 00 00 06 01 0a 00 07              request
+<<< 09 ff 00 00 01 06 01 0e 00 00 01 00 00 ..  four bytes, not six
+```
+
+Byte 39 is `0x30`, the `0` of `05.24`. A six-byte read takes `30 35` along with
+the block, and `set` posts them straight back as mode parameters — the same
+failure the Space One Pro section describes, one field further along. Observed
+here, with the bridge's default parameters rather than a mis-offset read:
+
+```
+before  ... 01 00 01 00 00 30 35 ...     byte 36 = 01, byte 37 = 00
+write   08 ee 00 00 00 06 81 10 00 01 1f ff 00 00 01 ad
+after   ... 01 01 1f ff 00 30 35 ...     byte 36 = 1f, byte 37 = ff
+```
+
+`1f ff` are the bridge's defaults for a model that keeps a custom transparency
+level there. This one does not: the write left two fields holding values nobody
+chose, and restoring them took a second write with the bytes read before the
+first. A four-byte write, carrying the device's own parameters with only the
+mode replaced, is accepted and changes nothing else:
+
+```
+>>> 08 ee 00 00 00 06 81 0e 00 01 01 00 00 8d
+<<< ACK, and the state reads back 01 01 00 00 — mode changed, neighbours intact
+```
+
+So the model row carries a width, and the rows that came before say six.
+
+#### No dial, no switch
+
+The Q30 has no ambient level and no wind noise reduction, and the four bytes
+hold neither. The row reports `mode` alone; `DeviceFollower` reads a missing
+`level` as -1 and draws no dial, which is what it already does for the JBL.
+
+#### What was verified on the hardware
+
+Off, ANC and Ambient were each set from the shell and read back from the device,
+and the mode the headphones reported afterwards matched every time. Battery
+continues to come from Fast Pair. Untested: charging state, the noise-cancelling
+sub-mode at byte 36 (transport / outdoor / indoor / custom in OpenSCQ30's A3028
+parser, and writable — that is how `1f` landed there), and the equalizer, which
+lives on a command this bridge does not send.
+
+## Samsung Galaxy Buds2 — SPPNew
+
+Confirmed on **Samsung Galaxy Buds2** (`84:5F:04:B5:D6:74`, modalias
+`bluetooth:v0075pA013d0001`). The device advertises Samsung's SPPNew UUID
+`2e73a4ad-332d-41fc-90e2-16bef06523f2`, in addition to the standard audio
+profiles and Google Fast Pair Message Stream. Fast Pair supplies the battery;
+SPPNew supplies the listening mode.
+
+The bridge opens the UUID through `org.bluez.Profile1` as a Classic client. The
+observed framing is:
+
+```
+FD <header u16 little-endian> <message id u8> <payload> <crc16> DD
+```
+
+The header's low ten bits carry the frame size and `0x1000` marks a request.
+The CRC is CRC-16/CCITT over the message id and payload. The Buds2 answered
+with this extended-status frame, which reports ANC and 18% in both earbuds:
+
+```
+fd2a00610b031212010111000000bf22010040014001030003660002001000000000110200010000400000993ddd
+```
+
+The bridge sends this manager-info request on connect and these observed noise
+control requests:
+
+```
+fd061088010122da58dd
+fd04107800f081dd   # Off
+fd04107801d191dd   # ANC
+fd04107802b2a1dd   # Ambient
+```
+
+`set talkthru` is deliberately not sent: the Buds2 model row exposes only the
+three modes seen in its status report. `samsung-bridge` and
+`tests/samsung_bridge_test.py` pin these frames and the status offsets; no
+other Samsung model or byte sequence is inferred here.
+
+What is read is as narrow as what is sent: the extended status (`0x61`) above,
+and a noise-controls update (`0x77`) by its first byte. The plain status
+message (`0x60`) has not been captured from this headset and is not read — a
+capture of one is the next thing worth adding. The charging bits at offset 36
+of the extended status have only been seen as `0x40`, nothing charging.
+
+## OPPO Enco Air3 Pro — HeyMelody on RFCOMM
+
+Confirmed on an **OPPO Enco Air3 Pro** (`28:6F:40:D9:A5:A7`, modalias
+`bluetooth:v02B0p0000d001F`, Fast Pair model id `06c197`, HeyMelody product id
+`065C10`). It advertises the HeyMelody SPP UUID
+`0000079a-d102-11e1-9b23-00025b00a5a5` alongside standard SPP
+(`00001101-…`), the audio profiles and the Google Fast Pair Message Stream
+(`df21fe2c-…`). Fast Pair supplies per-earbud battery (left, right and case);
+HeyMelody supplies the listening mode and a second battery reading.
+
+The channel is opened through `org.bluez.Profile1` as a Classic client on the
+HeyMelody UUID — BlueZ does the SDP lookup and hands over the socket, the same
+arrangement as the Sony and Xiaomi bridges. No handshake is needed; the device
+answers queries at once. Sequence numbers increment `0x01`-`0xFE` and are
+echoed back; `0x00`/`0xFF` were never sent here.
+
+How it was found: the UUID is the one
+[OppoPods](https://github.com/Leaf-lsgtky/OppoPods) connects on, and its
+`Packets.kt` names the ANC query (`0x010C` with payload `01 01`) this headset
+answers. An earlier round guessed `0x0104` for the query and `0x0404` SETs
+against it — every SET acked `00` and no GET ever moved, which is what a wrong
+guess looks like on this protocol: an ACK and silence. The `0x010C` query
+below is what the hardware itself confirmed.
+
+### Frames
+
+```
+AA <len varint> 00 00 <cmd u16 LE> <seq u8> <paylen u16 LE> <payload>
+len = 7 + paylen (single-byte varint on every frame seen here)
+```
+
+Query answers echo the query's sequence number. A SET is acked (`0x8404`
+payload `00`) and the GET after it names the new state; nothing unsolicited
+followed any SET here, so the bridge polls the GET every 3 seconds the way
+the Xiaomi one does.
+
+### Product id
+
+```
+->  aa 07 00 00 03 01 01 00 00                QUERY 0x0103 empty
+<-  aa 0b 00 00 03 81 01 04 00 00 10 5c 06    RET: status 00, id 10 5c 06 LE
+```
+
+`105c06` reads as `065C10`, the whitelist id OppoPods lists for the Enco Air3
+Pro. Asked once while probing; the bridge does not send it.
+
+### Listening mode
+
+```
+->  aa 09 00 00 0c 01 02 02 00 01 01          QUERY 0x010C payload 01 01
+<-  aa 0c 00 00 0c 81 02 05 00 00 01 01 08 00 RET: window 01 01 08 00 -> off
+```
+
+The mode is the `01 01 [v1] [v2]` window in the reply. Each SET below was sent,
+acked `00`, and read back with the GET naming the new state:
+
+```
+SET 0x0404 01 01 01  ->  ACK 00  ->  GET 01 01 08 00  off
+SET 0x0404 01 01 02  ->  ACK 00  ->  GET 01 01 10 00  anc
+SET 0x0404 01 01 04  ->  ACK 00  ->  GET 01 01 00 01  ambient
+```
+
+Fully encoded (sequence numbers as sent):
+
+```
+aa 0a 00 00 04 04 21 03 00 01 01 02          SET anc
+aa 08 00 00 04 84 21 01 00 00                ACK
+aa 09 00 00 0c 01 22 02 00 01 01             GET
+aa 0c 00 00 0c 81 22 05 00 00 01 01 10 00    RET anc
+```
+
+`SET 01 01 08` (the child bitmap for off) was also sent and read back
+`08 00`; the bridge sends the parent `01 01 01` for symmetry with the other
+two. Nothing else is sent: the brand's other bitmap positions (other NC
+levels, adaptive) were never answered here and stay out, and a reply window
+outside the three above leaves the mode where it was.
+
+### Battery
+
+```
+->  aa 07 00 00 06 01 03 00 00                QUERY 0x0106 empty
+<-  aa 0d 00 00 06 81 03 06 00 00 02 01 50 02 50
+                                          RET: count 02, left 0x50, right 0x50
+```
+
+Index 1 is left, 2 is right, 3 the case; bit 7 of the value is charging, the
+low seven bits the percentage — the same encoding OppoPods parses. This answer
+carried only the two buds (left 80%, right 80%, neither charging); the case
+came over Fast Pair at the same moment. The bridge reports what the reply
+carries and the Fast Pair stream wins while it is up.
+
+### In the widget
+
+[`oppo-bridge`](oppo-bridge) holds the socket and writes the same lines the
+other bridges do, with the battery as a fallback like the Nothing one:
+
+```json
+{"modes": true, "mode": "anc", "available": ["off","anc","ambient"],
+ "battery": {"left": 70, "right": 80, "charging": []}}
+```
+
+Commands on stdin: `set off|anc|ambient`. Exit codes match the other bridges:
+0 clean, 1 transient, 3 silent (connected, but the `0x010C` query went
+unanswered), 4 setup. `tests/oppo_bridge_test.py` pins the query, the three
+SETs and the four answers above frame for frame.
+
+### The probe
+
+[`tools/oppo_probe.py`](tools/oppo_probe.py) — registers the HeyMelody UUID,
+sends the ANC and battery queries, prints every frame decoded with its
+`01 01` window, and optionally writes one SET first:
+
+```bash
+tools/oppo_probe.py 28:6F:40:D9:A5:A7
+tools/oppo_probe.py 28:6F:40:D9:A5:A7 20 set:anc
+```
+
+The widget's bridge holds the same profile, so turn `useModeControl` off
+before running it — a second client is refused while the first is up.
+
+## Bose QC45 — BMAP over RFCOMM
+
+Confirmed on a **Bose QC45** (`AC:BF:71:64:56:B9`, 90% at capture time). Its SDP
+record (from `bluetoothctl info`) carries two vendor UUIDs — the Bose BMAP
+placeholder `00000000-deca-fade-deca-deafdecacaff` and `9b26d8c0-a8ed-440b-95b0-c4714a518bcc` —
+beside SPP and the audio profiles. Neither UUID names the channel BMAP lives
+on, and claiming one through `org.bluez.Profile1` does not reach BMAP at all:
+the deca-fade UUID's own service answers every connection with a repeating
+iAP2-style DETECT prelude (`ff 55 02 00 ee 10` every second) and the
+`9b26d8c0-…` service stayed silent. The bridge ignores the claims and opens a
+**raw RFCOMM socket** on channel **8** (found by probing `sdpconnect`'s table
+and the QC45's own quirk — BMAP rides on the channel its service record never
+states) and asks `[0.1]` until the headset answers.
+
+BMAP frames are `[fblock u8][func u8][flags u8][len u8][payload]`;
+the operator is the low nibble of flags. Init is function 1 of block 0;
+block 2 reports battery and block 31 controls modes. The stored capture
+prints decoded replies after a collection window, so it does not establish
+individual response or switching latency. START's PROCESSING is not mode
+confirmation: the bridge polls for the device's current-mode STATUS.
+
+### Frames
+
+Init — every GET answers only after this, and the answer is the probe:
+
+```
+->  00 01 01 00                [0.1]  GET
+<-  00 01 03 05 31 2e 31 2e 30 [0.1]  STATUS len 5: "1.1.0"
+```
+
+### Listening mode
+
+```
+->  1f 03 01 00                [31.3] GET
+<-  1f 03 03 01 01             [31.3] STATUS: mode index 1
+```
+
+`[31.3]` START sets the index; the readback GET is
+what the bridge reports:
+
+```
+->  1f 03 05 02 00 00 -> 1f 03 07 00   [31.3] START idx 0 -> PROCESSING
+    (on a subsequent readback)
+->  1f 03 01 00                      [31.3] GET
+<-  1f 03 03 01 00                   [31.3] STATUS idx 0
+```
+
+Index 1 (`01`) = Aware, index 0 (`00`) = Quiet. The QC45 has **no Off**; its
+custom slots 2 and 3 come back configured-but-blank from the GET-All burst and
+are never offered. GET-All (`[31.1] START` with empty payload) returned the
+burst that names them — `[31.1]` PROCESSING, `[31.2]` STATUS, `[31.3]` STATUS,
+`[31.5]` STATUS, `[31.6]` PROCESSING plus four 47-byte ModeConfig STATUS frames
+(mode 0 "Quiet", mode 1 "Aware", 2 and 3 blank), `[31.6]` RESULT, `[31.8]`
+STATUS, `[31.1]` RESULT — the bridge does not send it at runtime.
+
+### Battery
+
+```
+->  02 02 01 00                [2.2] GET
+<-  02 02 03 04 5a ff ff 00    [2.2] STATUS: 90%, then nothing for earbuds/case
+```
+
+The level is the first payload byte; the remaining bytes are `ff ff 00`.
+Their meanings, including charging, are not established by this capture. `{"headset": 90, "charging": []}` is the whole battery on
+this device.
+
+### In the widget
+
+[`bose-bridge`](bose-bridge) connects to channels 8, 2, 9 in turn and only
+counts one that answers the `[0.1]` probe, then writes the same lines the other
+bridges do, battery riding on the mode line since the QC45 has no earpieces:
+
+```json
+{"modes": true, "mode": "ambient", "available": ["anc","ambient"],
+ "battery": {"headset": 90, "charging": []}}
+```
+
+Commands on stdin: `set anc|ambient`. Exit codes match the other bridges: 0
+clean, 1 transient, 3 parked (sockets opened but no `[0.1]` answer, or no mode
+answer in ten seconds), 4 setup. `tests/bose_bridge_test.py` pins the probe, the
+two queries, the STARTs and the answers above frame for frame, and
+`tests/pins/bose/qc45.json` replays the decoded replies from the original
+capture plus a synthetic 89% battery-change sample, identified below.
+
+### The capture
+
+[`docs/captures/bose-qc45.txt`](docs/captures/bose-qc45.txt) records decoded
+init, 90% battery, mode GETs, START/PROCESSING/readbacks for indexes 0–3,
+and the GET-All burst. The original session ended with a verified return to
+Aware. RX headers are reconstructed in the pin from decoded fields; the file
+is not a complete raw-byte capture. In the
+[owner confirmation](https://github.com/ncr/omarchy-headphones/pull/13#issuecomment-5648598888),
+@Driskol explicitly identified the pin's `59 ff ff 00` (89%) sample as
+synthetic, derived from the observed 90% reply. It is a battery-change test,
+not an observed device reply; the original pin remains unchanged.
+
+The owner added two recordings in `d663c6d`, made with review revision
+`fc8d7f9`: [`bose-qc45-session.txt`](docs/captures/bose-qc45-session.txt)
+contains complete raw RX chunks and decoded frames for initialization, 100%
+battery, GET-All, mode 0–3 readbacks and verified restoration to initial mode
+1; [`bose-qc45-channels.txt`](docs/captures/bose-qc45-channels.txt) records
+the repeating DETECT prelude and silent Profile1 service described above.
+
+The complete `bluetoothctl info` output mentioned in the owner's comment is
+absent from the supplied files. The two vendor UUIDs have connection traces,
+but the full UUID list in the routing test is not independently corroborated
+by a stored SDP listing. The maintainer explicitly accepted this evidence
+gap for QC45 support in 1.3.2; no missing output was reconstructed.
+
+The updated [`tools/bose_session.py`](tools/bose_session.py) logs raw chunks
+at receipt, retains partial frames and restores the actual initial mode in
+`finally`, verifying readback or reporting failure. Release mode control
+before using it. Channel 8 is observed on this QC45; fallback candidates 2/9
+remain unverified on it. `bose_probe.py` is a diagnostic for the unsuccessful
+Profile1 route, not the recommended QC45 capture tool.
+
+See [the review and owner confirmation](docs/BOSE-REVIEW.md) for the owner's
+test results on `fc8d7f9`, software coverage and remaining evidence limits.
+
+## Bose QC35 — the [1.6] noise-cancelling path
+
+Confirmed on a **Bose QC35** (`04:52:C7:C2:A9:3E`, firmware `1.0.4`, 70% at
+capture time) on 2026-09-23. Same brand, same channel, same framing as the
+QC45 above — and a different question, because this generation does not
+serve the QC45's audio modes at all.
+
+Its SDP record carries the Bose BMAP placeholder
+`00000000-deca-fade-deca-deafdecacaff` beside SPP and the audio profiles, so
+`Model.js` already routes it to `bose-bridge` with no new claim. The full
+listing is in the capture; the QC45 has no equivalent stored.
+
+### Which question a headset gets, and why the headset decides
+
+```
+->  1f 03 01 00                [31.3] GET   the QC45's audio modes
+<-  1f 03 04 01 03             [31.3] ERROR this headset does not serve them
+->  01 06 01 00                [1.6]  GET   asked only after that ERROR
+<-  01 06 03 02 01 0b          [1.6]  STATUS
+```
+
+There is no model table here and no new bridge argument. Keying on the
+reported name was the obvious design and it does not hold: a Bose name is
+whatever its owner typed into the app — this unit's is the owner's own first
+name — and the QC45's capture carries no SDP listing to write its row from,
+so that row would have to be invented.
+
+So every Bose is asked `[31.3]` first, exactly as before this model was
+added, and only one that answers with an **ERROR**, before it has ever
+answered `[31.3]` with a STATUS, is asked `[1.6]` and polled on it from then
+on. An ERROR after a STATUS — a refused START, say — leaves the headset on
+`[31.3]`: no QC45 capture shows such an ERROR, so it must not move a QC45. A QC45 answers `[31.3]` with a STATUS and never
+reaches the fallback: its wire is unchanged frame for frame, which is what
+`tests/pins/bose/qc45.json` passing untouched demonstrates.
+
+### The noise-cancelling setting
+
+```
+->  01 06 01 00                [1.6] GET
+<-  01 06 03 02 01 0b          [1.6] STATUS: value 1, mask 0b1011
+->  01 06 02 01 03             [1.6] SETGET value 3
+<-  01 06 03 02 03 0b          [1.6] STATUS: value 3 — the set is answered
+                                     with the result, not with an ack
+->  01 06 02 01 02             [1.6] SETGET value 2
+<-  01 06 04 01 06             [1.6] ERROR: refused, and nothing moved
+```
+
+The payload is two bytes: what the headset is set to, then a bitmask whose
+set bits are the values it takes. This unit answered `0x0b` — bits 0, 1 and
+3 — and refused 2, the one value under 4 whose bit the mask leaves clear.
+Four values driven, four agreements with the mask. A `[1.6]` STATUS with
+only the value byte was never seen from this headset; the bridge falls back
+to the strengths it can name rather than guessing a support set.
+
+**0 is off, 1 the weaker strength and 3 the stronger.** The wire does not
+say which of 1 and 3 cancels more, and the published third-party tables for
+this protocol say the reverse of what this headset does, so the naming is
+not taken from them: the owner ranked the three values by ear with the
+values unnamed during the test, twelve seconds each, two rounds, and
+reported 3 the quietest and 0 the loudest. A copied table would have put the
+panel's High button on the weaker setting.
+
+Because the two strengths are one mode graded twice rather than two modes,
+the line carries the panel's strength row — `ancLevel` and `ancLevels`, the
+keys `nothing-bridge` fills — and `set anc` asks for the strength last seen,
+as it does on every other brand. This headset has no ambient and no
+TalkThru; neither is offered or sent, and neither is an ambient dial, a
+voice switch nor a low-latency switch.
+
+### Battery
+
+```
+->  02 02 01 00                [2.2] GET
+<-  02 02 03 01 46             [2.2] STATUS: 70%
+```
+
+One byte on this generation, where the QC45 answers four. The existing
+parser reads the first byte and needs no change. 70% is what BlueZ's own
+`Battery Percentage` reported at the same moment. Charging is not
+established by this capture.
+
+### In the widget
+
+```json
+{"modes": true, "mode": "anc", "available": ["off","anc"],
+ "ancLevel": "low", "ancLevels": ["low","high"],
+ "battery": {"headset": 70, "charging": []}}
+```
+
+Commands on stdin: `set off`, `set anc`, `level low|high`. Exit codes are the
+shared ones. `tests/pins/bose/qc35.json` freezes the session and
+`tests/bose_qc35_test.py` covers what a pin cannot say: that the fallback is
+reached only on the headset's own ERROR, that a QC45 never reaches it, the
+mask, the naming, split and coalesced reads, the unsolicited `[5.1]` and
+`[4.2]` frames this headset emits after the init and the bridge steps over,
+and timeout, readback and link loss driven through the clock and the loop.
+
+### The capture and its limits
+
+[`docs/captures/bose-qc35.txt`](docs/captures/bose-qc35.txt) has the SDP
+record, the read-only discovery, the driven session with the refusal and the
+verified restoration, the ranking run behind the naming, and `bose-bridge`
+itself against the headset. Raw reads are logged at receipt before framing;
+each step waits a fixed collection window, so no timestamp there measures
+response latency.
+
+### Tested on the headset
+
+By [@pedrohfp](https://github.com/pedrohfp) on `3aa8974`, with the plugin
+installed from that revision and nothing else holding channel 8:
+
+| Run | Result |
+|:--|:--|
+| Read-only discovery | init `1.0.4`, battery `02 02 03 01 46` (70%, matching BlueZ), `[31.3]` ERROR, `[1.6]` `01 0b` |
+| Driven session | values 0, 1 and 3 accepted and read back; 2 refused with `01 06 04 01 06` and the setting did not move; initial value restored and the restoration verified |
+| Bridge over its own pipe | first reading, `set off`, `set anc`, `level low`, `level high`, seven unsupported commands that sent nothing, restoration, exit 0 |
+| Reconnect | `bluetoothctl disconnect` showed `not connected`; after reconnect mode, strength and battery all returned, and a strength set before the cycle survived it |
+| Panel | Off, ANC, Low and High all responded; the owner reports the three states audibly distinct, High the stronger cancelling |
+
+### Not established
+
+- **Unsolicited changes.** Three windows totalling 110 seconds recorded no
+  `[1.6]` frame the bridge had not asked for, but the owner did not operate
+  the headset's own controls during any of them, so whether it announces a
+  change made on the headset is unknown. A panel change travels through the
+  bridge and does not count. The bridge polls every four seconds either way.
+- **Channels 2 and 9** were never tried on this headset, because 8 answered
+  the probe first — untried, not refused.
+- **Charging.** The battery read 70% throughout; `charging` is always empty.
+- **The support mask** is an inference from four observations matching
+  `0x0b`. No other mask has been seen from any Bose.
+- **Peer isolation** is simulated in `tests/bose_qc35_test.py`; no second
+  headset was connected alongside.
+- **The `[5.1]` and `[4.2]` frames** sent after the init are recorded in the
+  capture and stepped over by the framer; their meaning is not known.
+
+## Canonical owner captures — 2026-09-08
+
+The maintainer @ncr retested his **Sony WH-CH720N** and **JBL TUNE230NC TWS**.
+Selected actual HCI packets are retained in
+[`docs/captures/sony-wh-ch720n.txt`](docs/captures/sony-wh-ch720n.txt) and
+[`docs/captures/jbl-tune230nc-tws.txt`](docs/captures/jbl-tune230nc-tws.txt),
+with original packet identifiers and timestamps. Full SDP records sit beside
+them as `*-bluetoothctl.txt`. The files identify their source and the filtering
+applied; unrelated radio traffic is omitted.
+
+The Sony capture includes mode notifications for Off, ANC and Ambient,
+Ambient levels 0, 5 and 20, and Focus on voice on/off. Its Fast Pair battery
+frame is `03 03 00 01 27`: one battery at 39%. The JBL capture includes
+Off, ANC, Ambient and TalkThru reports. Its battery frame is
+`03 03 00 03 46 50 43`: left 70%, right 80%, case 67%, none charging.
+These are samples from that session, not fixed battery expectations on hardware.
+
+The new `*-canonical.json` pins replay selected frames while leaving the old
+pins unchanged. `tests/canonical_evidence_test.py` checks their mode bytes and
+the indexed battery frames against the captures. A separate successful live
+IPC run checked all controls, battery snapshots, mode persistence after a
+refresh request, mode recovery after reconnect of each pair, peer state and
+restoration: [`canonical-live.json`](docs/captures/canonical-live.json).
+See [`docs/CANONICAL-TESTS.md`](docs/CANONICAL-TESTS.md) for coverage and limits.
+
+## TOZO NC9 Pro
+
+Owner: [@seth-reee](https://github.com/seth-reee). Evidence is in
+`docs/captures/tozo-nc9-pro-phone.txt` (selected phone ATT packets with packet
+numbers and screenshot time mapping) and `tozo-nc9-pro-live.txt` (timestamped
+Linux readback). The earlier investigation is `tozo-nc9-pro.txt`. No other
+TOZO model is claimed. Earbud firmware query returned `00 01 06 00 05 02 00
+05 02 0e`; the case app screenshot displays V1.1.5 and its query returned
+`01 01 03 01 01 05 07`.
+
+In the owner's confirmed session, the responding earbud's public LE address
+equalled its Classic address. A later scan also found `D5:4B:F8:C1:5F:99`
+advertising as TOZO NC9 Pro with B610, but it did not answer mode or battery
+queries, so it is not selected as a substitute. The responding GATT
+service is `0000b610-0000-1000-8000-00805f9b34fb`, write-without-response
+characteristic B611, notify B612. The Classic SDP list initially contains
+only standard audio and Serial Port UUIDs. Routing requires the exact
+reported name `TOZO NC9 Pro` and either that Serial Port UUID or B610; it
+cannot claim arbitrary Serial Port headphones. Existing vendor UUID rows
+retain priority.
+
+Each observed GATT value is `group command length payload checksum`, where
+checksum is the sum of payload bytes modulo 256. Queries have zero-length
+payload and zero checksum. Notifications are complete datagrams: partial,
+combined, bad-length, bad-checksum and unsupported values are rejected.
+
+| Operation | TX | Observed RX |
+|:--|:--|:--|
+| Earbud battery | `00 02 00 00` | `00 02 02 64 64 c8` (left/right 100%) |
+| Current mode | `00 30 00 00` | `00 30 01 xx xx` (observed values below) |
+| Associated case address | `00 20 00 00` | `00 20 06 41 42 b1 f6 f8 4f 71` |
+| Case's associated earbuds | `01 09 00 00` | `01 09 06 94 4b f8 c1 5f 98 8f` |
+| Case battery | `01 02 00 00` | `01 02 01 64 64` (100%) |
+
+The case has its own public LE address, provided by the earbuds, and service
+`000001ff-3c17-d293-8e48-14fe2e4da212`, also B611/B612. Its read group is 01,
+not the earbuds' 00. The bridge verifies its reverse address before accepting
+case battery. Case unavailability does not disable the earbuds. A previous
+case reading is marked stale after its link or response is lost. Case retries
+are bounded and target only the address reported by this pair.
+
+| App mode | Bridge name | Captured SET | Settled query reply |
+|:--|:--|:--|:--|
+| Normal | off | `10 04 01 00 00` | `00 30 01 00 00` |
+| Noise Cancellation | anc | `10 04 01 01 01` | `00 30 01 01 01` |
+| Transparency | ambient | `10 05 01 01 01` | `00 30 01 02 02` |
+| Reduce Wind Noise | wind | `10 07 01 01 01` | `00 30 01 03 03` |
+| Leisure Mode | leisure | `10 08 01 01 01` | `00 30 01 04 04` |
+| Adaptive Mode | adaptive | `10 11 01 01 01` | `00 30 01 06 06` |
+
+SET success is `10 <same command> 01 00 00`; it does not contain the resulting
+mode. Immediate mode queries were observed to return intermediate states.
+The bridge waits 1.5 seconds after the acknowledgement, then queries mode;
+it never displays the requested mode from the write or acknowledgement.
+Queued controls run one at a time. It also polls the mode every ten seconds
+and battery every thirty seconds. Observed `20 0d 02 01 03 04` and
+`20 0d 02 01 01 02` change notifications trigger delayed readback without
+assuming their payload is the query enum.
+
+All percentages in these owner captures are 100. There is no observed
+charging or unknown-value encoding; no high-bit charging interpretation is
+implemented. Tests label damaged frames and boundary values as synthetic.
+No EQ, case display settings, firmware writes, or unobserved mode values are
+implemented. Six-mode UI additions are enabled only for the TOZO backend;
+the legacy four-mode default is preserved.
+
+Capture using `tools/tozo_probe.py ADDRESS --cycle --listen 10` in an isolated
+checkout after releasing the widget's mode bridge. It reads the initial mode,
+cycles the six known modes, verifies each query reply and restores the
+observed initial mode in a `finally` block. A failed restoration is a failure,
+not a successful test. See `docs/TOZO-NC9-PRO-TESTS.md` for the final live report.
+
+## HUAWEI FreeBuds SE 2 — battery over SPP
+
+Owner: [@defkode](https://github.com/defkode). Evidence is
+`docs/captures/huawei-freebuds-se-2.txt` (three `tools/huawei_probe.py`
+sessions, the third guided step by step; serial numbers masked) and `huawei-freebuds-se-2-bluetoothctl.txt`
+(the complete SDP list). Model BTFT0016, firmware 1.0.1.129. No other Huawei
+model is claimed.
+
+The earbuds have no Fast Pair stream, and BlueZ alone sees one figure for the
+pair. They have no noise control. What they do have is a vendor channel on
+plain RFCOMM channel 1 (16 refused the connection), behind the Serial Port
+UUID; the record carries nothing Huawei-specific. Routing therefore requires
+the exact reported name `HUAWEI FreeBuds SE 2` and the Serial Port UUID, like
+the TOZO row, and cannot claim arbitrary Serial Port headphones.
+
+### Frames
+
+    5A <len u16 BE> 00 <service> <command> <tlv...> <crc u16 BE>
+
+`len` counts from the `00` to the last TLV byte. The CRC is CRC-16/XMODEM
+(init 0, poly 1021, no reflection) over everything before it; every captured
+frame checks. Each TLV is `<tag> <length> <value>`, and a query is the tags
+it wants with zero length.
+
+| Operation | TX | Observed RX |
+|:--|:--|:--|
+| (channel opens) | — | `5a 00 03 00 01 06 3e bd`, empty, once |
+| Battery | `5a 00 09 00 01 08 01 00 02 00 03 00 fb b9` | `5a 00 14 00 01 08 01 01 61 02 03 61 61 17 03 03 00 00 00 04 02 14 0a 5c 87` |
+| Battery, unasked | — | the same tags as `01 27`, on connect and on every change |
+| Device info | `01 07` with empty tags 0–24 | firmware (tag 07), model (0F), build (0A), serials (09, 18) |
+| Lid closes on / opens off a bud | — | `5a 00 06 00 2b 5f 01 01 01 13 24` / `… 01 01 00 03 05` |
+
+In the battery answer, tag 1 is an overall level, tag 2 three bytes — left,
+right, case — and tag 3 three more in the same order, which look like
+charging bytes but are not read (below). Tag 4 (`14 0a`) never changed.
+
+### What was verified on the hardware
+
+- Both buds and the case reported from the first frame.
+- A bud taken out of the ear and held sends nothing: no `2b 5f`, no
+  battery change. `2b 5f` is not a wear sensor.
+- A bud put in the case with the lid open keeps reporting its own level.
+  When the lid **closes** on it, `2b 5f 01` arrives and the bud reads **0**;
+  when the lid opens, `2b 5f 00` and its level again. The overall level did
+  not follow it to 0. Seen for each bud.
+- **The case is reported second-hand, through a docked bud.** In session 3
+  the case byte in tag 3 went `01` → `00` → `01` in step with the cable,
+  but the left bud was docked throughout. Afterwards, with the bridge
+  running, the owner unplugged the case and the byte stayed `01`, and the
+  case level rose 68 → 72 *after* the unplug. The owner saw the case figures
+  refresh when the left bud docked, and later when the right one did
+  (72 → 84). So the case byte is not a live charging state, and the case
+  level lags in the same way: both are as fresh as the last docking.
+- The buds' bytes in tag 3 stayed `00` throughout, including the left bud
+  sitting in the case, on battery and on the cable, at 95%.
+- The battery query was answered every time it was asked, 3–5 s apart.
+- **One client at a time.** With the owner's phone also connected, the
+  earbuds refused channel 1 (`ECONNREFUSED`) on every attempt, though their
+  SDP record still served it there; with the phone switched off, the same
+  connect was answered at once. The record lists a second serial service,
+  `COM6` on channel 4 under UUID `7033`; it is not used, and was not probed
+  past a connect.
+
+### In the widget
+
+`huawei-bridge` asks for the battery on connect, then takes the earbuds'
+own `01 27` announcements, with a query every 60 s as a backstop. A 0 is a
+bud that is not reporting — it is left out of the line rather than drawn
+empty. Tag 3 is not read, so no part is ever reported charging: the Case
+row's no-bolt rule in `Panel.qml` holds here for the reason it was written,
+a case reported second-hand says "charging" late. A refused channel is
+exit 1 with a line naming the likely holder, so the panel says why and the
+shell keeps retrying until the phone lets go. The line is
+`"modes": true, "available": []`, which hides the mode row.
+
+### Not established
+
+Whether a bud's charging byte ever changes — at a lower level than 95%,
+perhaps. What tag 4 means. No write
+was ever sent.
+
+## QCY H3: battery only, no reachable control channel
+
+Owner: [@carraly](https://github.com/carraly). The evidence is
+[`docs/captures/qcy-h3-bluetoothctl.txt`](docs/captures/qcy-h3-bluetoothctl.txt)
+(the BlueZ device view) and
+[`docs/captures/qcy-h3-live.txt`](docs/captures/qcy-h3-live.txt) (the live
+probe, complete and unedited). This model is a battery-only finding because
+that is the whole of what the headset answered on this host: the battery
+figure through BlueZ's own battery service, and nothing on any control
+channel.
+
+A **QCY H3** (`84:AC:60:4A:43:F0`, public). Its Classic SDP carries only the
+standard set the BlueZ view lists — Serial Port `00001101`, Audio Sink
+`0000110b`, A/V Remote Control Target `0000110c`, Advanced Audio
+Distribution `0000110d`, A/V Remote Control `0000110e`, Handsfree `0000111e`,
+PnP Information `00001200` — and no GATT UUID.
+
+What one `--spp` run shows, with the H3 connected, is these three things:
+
+- **GATT: no tree at all.** The probe waits the 45 seconds it allows for the
+  device's managed-objects tree to fill, and then logs
+  `GATT TREE 0 services 0 characteristics under /org/bluez/hci0/dev_84_AC_60_4A_43_F0`:
+  no `GattService1` and no `GattCharacteristic1` object appears.
+- **The SDP server names the Serial Port channel.** SDP is not an RFCOMM
+  service: it is an L2CAP service on PSM 1, so the probe opens
+  `SDP CONNECTED psm 1` there and sends a well-formed
+  `SDP_SERVICE_SEARCH_ATTR_REQ` (PDU `0x06`) for the `00001101` record:
+  `06 00 01 00 16 35 03 19 11 01 02 00 35 0c 09 00 00 09 00 01 09 00 04 09 00 05 00`.
+  That is a search pattern holding the 16-bit UUID `0x1101`, then the maximum
+  answer size `0x0200`, then the attribute IDs `0x0000`, `0x0001`, `0x0004`
+  and `0x0005`, then a continuation byte of 0. It is answered 14 ms later with
+  `SDP RX 07 00 01 00 56 …` — an `SDP_SERVICE_SEARCH_ATTR_RSP` (PDU `0x07`)
+  whose AttributeLists hold **two identical Serial Port records**, both with
+  record handle `0x00010004`. Each carries a `ServiceClassIDList` of `0x1101`
+  and a `ProtocolDescriptorList` (attribute `0x0004`) whose RFCOMM entry is
+  `19 00 03 08 01`, i.e. UUID `0x0003` with server channel **1**. The probe
+  logs `SPP SDP CHANNEL 1` and opens that channel.
+- **Frames sent on that channel, nothing back.** On the channel the record
+  names, the four read requests go out one at a time, each followed by a
+  500 ms read: `TX fe 01 02`, `TX fe 01 0c`, `TX fe 01 17`, `TX fe 01 30`,
+  and `RX none` after every one of them. Not one byte comes back, and no
+  `RX closed by peer` line appears: the headset holds the channel open and
+  says nothing to it.
+
+So the mode row is correct as `unsupported`: there is a battery (one figure,
+70 % in the bluetoothctl capture) and no control channel the plugin could
+hold. The Serial Port record does name channel 1, but the four frames the QCY
+standard table lists are answered there by nothing, so no `qcy-bridge` exists
+or is intended from this finding. The plugin does not invent bytes for a
+headset that answered none.
+
+### Where those four frames come from
+
+`fe 01 02`, `fe 01 0c`, `fe 01 17` and `fe 01 30` are the read requests of the
+QCY standard protocol table — battery, listening mode, anc setting, version —
+`SPP_FRAMES` in `tools/qcy_probe.py`. They come from
+public reverse-engineering of the QCY/Quicky protocol, not from anything this
+headset ever answered; the capture above is what the headset does with them,
+which is nothing. The `01 00` tails of `fe 01 0c 01 00` and `fe 01 17 01 00`
+that an earlier revision of the probe listed are the length and the value of a
+*setting* (mode 0, anc 0), so the probe sends the bare queries `fe 01 0c` and
+`fe 01 17` instead. Nothing in `SPP_FRAMES` carries a parameter at all, so no
+run of this probe can set a mode on anybody's headphones.
+
+## JBL Tour Pro 3 — Airoha RACE on the vendor RFCOMM channel
+
+A **JBL Tour Pro 3** (`A0:11:22:33:44:55`, modalias `bluetooth:v0094p0004d0100`)
+is not served by `jbl-bridge`. Its LE GATT tree has no `excelpoint.com` service
+(`65786365-…`): the vendor services are Airoha's (`5052494d-2dab-0341-…`, the
+bytes spell `PRIM…ohaBLE`) plus the usual GAP, battery, device information and
+`fe2c` ones. With the default handles `jbl-bridge` fails with "Failed to
+register notify handler". The Fast Pair stream still carries the battery
+(left, right, case), so that part works unchanged; the listening mode does not.
+
+Its classic record lists the vendor UUID `00000000-0000-0000-0099-aabbccddeeff`
+([`docs/captures/jbl-tour-pro-3-bluetoothctl.txt`](docs/captures/jbl-tour-pro-3-bluetoothctl.txt)).
+That channel opens without pairing prompts and speaks Airoha's RACE framing:
+
+```
+05 <type> <length u16 LE> <command u16 LE> <payload>
+type  5a command · 5b reply · 5c / 5d notification
+```
+
+Two other vendor UUIDs in the record (`5052494d-2dab-0341-…`,
+`454c4261-686f-7269-4103-ab2d60875250`) accept a connection and answer every
+write with `01 aa 00 00 06`: they were not pursued.
+
+What the earbuds were seen to do, from a passive listener, from the JBL
+Headphones app's phone-side HCI snoop log, and from a replay of the app's own
+frames ([`docs/captures/jbl-tour-pro-3.txt`](docs/captures/jbl-tour-pro-3.txt)):
+
+| | frame |
+|:--|:--|
+| get mode | `05 5a 04 00 01 09 05 00` |
+| reply | `05 5b 09 00 01 09 05 00 00 <mode> <b> <c> <t>` |
+| event, on any change | `05 5d 08 00 01 09 05 00 00 <mode> <b> <c>` |
+| set Off | `05 5a 04 00 06 0e 00 0b` |
+| set ANC | `05 5a 06 00 06 0e 00 0a 01 00` |
+| set Ambient | `05 5a 06 00 06 0e 00 0a 0a 04` |
+| set TalkThru | `05 5a 06 00 06 0e 00 0a 09 04` |
+
+`<mode>` is `00` Off, `01` ANC, `0a` Ambient, `09` TalkThru, in replies and
+events alike. The three bytes after it differ between the two (Off is
+`00 00 00` in a reply, `00 1e e4` in an event; TalkThru `09 00 00` against
+`09 00 04`) and are not read. A set is acknowledged by an echo of its payload
+(`05 5b 08 00 06 0e 00 0a 01 00 00 00`, the last bytes varied between runs)
+and followed by the event; the acknowledgement is not read. The earbuds do not
+announce their mode on connect, so the bridge asks.
+
+Checked on one pair: Off → ANC → Ambient → TalkThru → Off from a PC, every
+reply and event matching the table, the earbuds back in Off at the end and
+audio uninterrupted. Through the installed plugin as well (IPC set and read back for each mode, restored to Off). **Not tested:** the ambient level, ANC strength, wear
+detection, the case's screen, charging state, a second device connected at the
+same time, and any reconnect behaviour of the bridge itself on hardware.
+Other commands the app sends at connect (`09 00`, `0b 00`, `d6 0c`, `26 0e`,
+`17 0e`, `83 2c`, `75`) are shown in the capture and are not understood.
+
+Airoha's RACE channel is reported to accept far more than mode control on
+some devices (flash and RAM access; see ERNW's white paper on the Airoha
+chipset). The bridge sends only the five frames above, the ones the JBL app
+sends.
+
+### JBL Tour Pro 3 — wear detection
+
+The earbuds announce each ear's wear state unprompted, `05 5c 05 00 0c 00 00 <ear> <state>`:
+`<ear>` 00 or 01 (which is the left is not known), `<state>` 01 in the ear, 00 out.
+Polarity is fixed by the two ends of [`docs/captures/jbl-tour-pro-3-wear.txt`](docs/captures/jbl-tour-pro-3-wear.txt):
+both ears `01` when the earbuds were put back in, `00` when taken out. The earbuds
+do not state it on a fresh connection, and the app's `0009` queries answered
+`… 00 00` even while worn, so no query is used and `worn` is absent from the bridge's
+line until an ear has spoken. `worn` is `false` once both ears are known and out, `true`
+while any ear is in — one bud out does not pause the music. The shell already pauses
+and resumes media on a `worn` edge (`pauseMediaOnDisconnect`).
+
+Not seen: a wear frame in a single read separating an ear that was never in from one taken out.
+
+### JBL Tour Pro 3 — levels, adaptive ANC and spatial state
+
+From the app's phone-side HCI snoop log with the app force-closed and reopened between
+steps, so each connect re-reads the state ([`docs/captures/jbl-tour-pro-3-levels.txt`](docs/captures/jbl-tour-pro-3-levels.txt)).
+LDAC was off. Spatial sound cannot be applied while LDAC is on.
+
+| setting | read | write | in the plugin |
+|:--|:--|:--|:--|
+| Ambient level, 1-7 | `05 5a 04 00 01 09 07 00` → `… 01 09 07 00 00 <level> 00`; also the byte after the mode in a mode reply or event | `05 5a 06 00 06 0e 00 1e <level> 00`, acknowledged by an echo with no level | yes: the panel's Ambient dial, only while in Ambient |
+| ANC strength, 1-7 | the byte after the mode in a mode reply or event, only while in ANC | the same `1e` frame, applied to the mode the earbuds are in | yes: a numeric slider under ANC; written only in ANC, confirmed by asking the mode read again |
+| Adaptive ANC | `05 5a 04 00 17 0e 03 02` → `05 5b 05 00 17 0e 00 03 <state>` | `05 5a 04 00 17 0e 03 01` on / `… 03 00` off, echoed | no: the panel has no switch for it |
+| Spatial sound | notification `05 5d 05 00 13 00 00 <x> 01`, `x` 00 off, 01 on (fixed or head tracking, not told apart) | none seen on this channel | no |
+
+The `1e` write acts on whichever of ANC or Ambient the earbuds are in, which is why
+the bridge writes it only in Ambient. A set is never trusted: the bridge asks for the
+Ambient level again 0.3 s later and prints what the earbuds say.
+
+Auto-compensation was seen too: read with the byte after `0d` in the answer to
+`05 5a 06 00 26 0e 00 0d 00 00`, notified as `05 5d 05 00 86 00 00 <state> 00`, turned
+off with `05 5a 03 00 95 00 00`; turning it on is a long ANC-set frame whose fields
+are not understood. Not used.
+

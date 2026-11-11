@@ -1,0 +1,1442 @@
+// Model.js holds the picking, parsing and formatting, with no QML imports, so it
+// runs outside the shell. The cases here are the ones that bite: a bud that
+// reports nothing, a reader line that is not JSON, a set with one battery, and a
+// device list where the wrong device is easy to pick.
+//
+//   deno test --allow-read tests/model.test.js
+//
+// Loading: Model.js is plain script text, not a module, because QML imports it
+// with `import "Model.js" as Model`. Read and evaluate it, then pull the
+// functions out of the resulting scope. The export list is derived from the
+// source rather than written by hand: a hand-written one drifts silently, and a
+// helper that is missing from it simply reads as undefined here, so a test for
+// it would fail for the wrong reason (or never be written at all).
+
+import { assertEquals } from "jsr:@std/assert@1";
+
+const source = await Deno.readTextFile(
+  new URL("../Model.js", import.meta.url),
+);
+const exported = [
+  ...source.matchAll(/^function\s+(\w+)/gm),
+  ...source.matchAll(/^var\s+(\w+)\s*=/gm),
+].map((match) => match[1]);
+const Model = new Function(
+  source + "\nreturn { " + exported.join(", ") + " };",
+)();
+
+Deno.test("every top-level helper and glyph constant is reachable", () => {
+  // Guards the derivation above: if the regexes stop seeing the source, this
+  // fails here instead of turning every other test into `undefined is not a
+  // function`.
+  for (const name of ["tooltip", "statusLine", "parseSupport", "supportVerdict"]) {
+    assertEquals(typeof Model[name], "function", name);
+  }
+  assertEquals(Model.UNKNOWN_GLYPH, "\u{f0091}");
+  assertEquals(Model.HEADPHONES_GLYPH, "\u{f02cb}");
+  const missing = exported.filter((name) => Model[name] === undefined);
+  assertEquals(missing, []);
+});
+
+const buds = (extra = {}) => ({
+  name: "JBL TUNE230NC TWS",
+  address: "AA:BB:CC:DD:EE:FF",
+  icon: "audio-headset",
+  paired: true,
+  connected: true,
+  batteryAvailable: true,
+  battery: 0.2,
+  ...extra,
+});
+
+const mouse = (extra = {}) => ({
+  name: "MX Master 4",
+  address: "AA:BB:CC:DD:EE:FF",
+  icon: "input-mouse",
+  paired: true,
+  connected: true,
+  batteryAvailable: true,
+  battery: 0.9,
+  ...extra,
+});
+
+Deno.test("deviceLabel prefers the name and falls back to the address", () => {
+  assertEquals(Model.deviceLabel(buds()), "JBL TUNE230NC TWS");
+  assertEquals(
+    Model.deviceLabel({ name: "", deviceName: "", address: "AA:BB:CC:DD:EE:FF" }),
+    "AA:BB:CC:DD:EE:FF",
+  );
+  // With no user-set alias the device-reported name carries it.
+  assertEquals(
+    Model.deviceLabel({ name: "", deviceName: "Sony WH", address: "B0:11:22:33:44:55" }),
+    "Sony WH",
+  );
+  assertEquals(Model.deviceLabel(null), "");
+});
+
+Deno.test("isAudioDevice falls back to the name when BlueZ sends no icon", () => {
+  assertEquals(Model.isAudioDevice({ icon: "", name: "Pixel Buds Pro" }), true);
+  assertEquals(Model.isAudioDevice({ icon: "", name: "MX Master 4" }), false);
+  assertEquals(Model.isAudioDevice(null), false);
+});
+
+Deno.test("an empty filter accepts audio devices only", () => {
+  assertEquals(Model.matchesFilter(buds(), ""), true);
+  assertEquals(Model.matchesFilter(mouse(), ""), false);
+  // A named filter is matched against the name and the address, case-insensitively.
+  assertEquals(Model.matchesFilter(buds(), "jbl"), true);
+  assertEquals(Model.matchesFilter(buds(), "aa:bb"), true);
+  assertEquals(Model.matchesFilter(buds(), "sony"), false);
+  // ...and it overrides the audio check, so a filter can name anything.
+  assertEquals(Model.matchesFilter(mouse(), "MX Master"), true);
+});
+
+Deno.test("pickDevice takes the connected earbuds over a paired mouse", () => {
+  const picked = Model.pickDevice([mouse(), buds()], "");
+  assertEquals(Model.deviceLabel(picked), "JBL TUNE230NC TWS");
+});
+
+Deno.test("pickDevice prefers connected over the last used", () => {
+  const sony = buds({ name: "WH-CH720N", address: "B0:11:22:33:44:55", connected: false });
+  const picked = Model.pickDevice([sony, buds()], "", "B0:11:22:33:44:55");
+  assertEquals(Model.deviceLabel(picked), "JBL TUNE230NC TWS");
+});
+
+Deno.test("with nothing connected, the last used device wins", () => {
+  const sony = buds({ name: "WH-CH720N", address: "B0:11:22:33:44:55", connected: false });
+  const jbl = buds({ connected: false });
+  const picked = Model.pickDevice([jbl, sony], "", "B0:11:22:33:44:55");
+  assertEquals(Model.deviceLabel(picked), "WH-CH720N");
+});
+
+Deno.test("pickDevice ignores devices that are neither paired nor connected", () => {
+  assertEquals(Model.pickDevice([buds({ paired: false, connected: false })], ""), null);
+  assertEquals(Model.pickDevice([], ""), null);
+  assertEquals(Model.pickDevice(null, ""), null);
+});
+
+Deno.test("rankDevices puts the connected first and orders the rest by name", () => {
+  const sony = buds({ name: "WH-CH720N", address: "B0:11:22:33:44:55" });
+  const jbl = buds();
+  // Both connected and both reporting: the tie goes to the name, so the icons
+  // keep their places in the bar between one reading and the next.
+  assertEquals(
+    Model.rankDevices([sony, jbl], "").map(Model.deviceLabel),
+    ["JBL TUNE230NC TWS", "WH-CH720N"],
+  );
+  // ...and the set used last breaks it first, which is what the bar reads as
+  // "the one you just put on".
+  assertEquals(
+    Model.rankDevices([jbl, sony], "", "B0:11:22:33:44:55").map(Model.deviceLabel),
+    ["WH-CH720N", "JBL TUNE230NC TWS"],
+  );
+  // Connected still beats everything, whatever it is called.
+  assertEquals(
+    Model.rankDevices([jbl, buds({ name: "AAA", connected: false })], "")
+      .map(Model.deviceLabel),
+    ["JBL TUNE230NC TWS", "AAA"],
+  );
+  assertEquals(Model.rankDevices([mouse()], ""), []);
+  assertEquals(Model.rankDevices(null, ""), []);
+});
+
+Deno.test("followedAddresses names every connected match", () => {
+  const sony = buds({ name: "WH-CH720N", address: "B0:11:22:33:44:55" });
+  const jbl = buds();
+  // Two headsets on one desk are two followers, not a competition.
+  assertEquals(Model.followedAddresses([sony, jbl], ""), [
+    "AA:BB:CC:DD:EE:FF",
+    "B0:11:22:33:44:55",
+  ]);
+  // A filter still applies, and a mouse is never audio.
+  assertEquals(Model.followedAddresses([sony, jbl, mouse()], "jbl"), [
+    "AA:BB:CC:DD:EE:FF",
+  ]);
+  // With nothing connected it falls back to the one device that would have been
+  // picked, so the widget can name the earbuds it is waiting for.
+  const parked = [
+    buds({ connected: false }),
+    buds({ name: "WH-CH720N", address: "B0:11:22:33:44:55", connected: false }),
+  ];
+  assertEquals(Model.followedAddresses(parked, "", "B0:11:22:33:44:55"), [
+    "B0:11:22:33:44:55",
+  ]);
+  // A connected device beats that fallback outright: the paired one is left out.
+  assertEquals(Model.followedAddresses([parked[1], jbl], "", "B0:11:22:33:44:55"), [
+    "AA:BB:CC:DD:EE:FF",
+  ]);
+  assertEquals(Model.followedAddresses([mouse()], ""), []);
+  assertEquals(Model.followedAddresses([], ""), []);
+});
+
+Deno.test("deviceByAddress is how a follower stays pinned to one set", () => {
+  const sony = buds({ name: "WH-CH720N", address: "B0:11:22:33:44:55" });
+  const jbl = buds();
+  assertEquals(
+    Model.deviceLabel(Model.deviceByAddress([jbl, sony], "B0:11:22:33:44:55")),
+    "WH-CH720N",
+  );
+  // Whatever cased the address, it is the same device.
+  assertEquals(
+    Model.deviceLabel(Model.deviceByAddress([jbl, sony], "b0:11:22:33:44:55")),
+    "WH-CH720N",
+  );
+  assertEquals(Model.deviceByAddress([jbl], "B0:11:22:33:44:55"), null);
+  assertEquals(Model.deviceByAddress([jbl], ""), null);
+  assertEquals(Model.deviceByAddress(null, "AA:BB:CC:DD:EE:FF"), null);
+});
+
+Deno.test("sortFollowers orders the icons the way the bar draws them", () => {
+  const follower = (name, address, connected = true) => ({ name, address, connected });
+  const jbl = follower("JBL TUNE230NC TWS", "AA:BB:CC:DD:EE:FF");
+  const sony = follower("WH-CH720N", "B0:11:22:33:44:55");
+  assertEquals(
+    Model.sortFollowers([sony, jbl], "").map((f) => f.name),
+    ["JBL TUNE230NC TWS", "WH-CH720N"],
+  );
+  assertEquals(
+    Model.sortFollowers([jbl, sony], "b0:11:22:33:44:55").map((f) => f.name),
+    ["WH-CH720N", "JBL TUNE230NC TWS"],
+  );
+  // A device in its case sinks below one that is here, whatever its name.
+  const parked = follower("AAA", "11:22:33:44:55:66", false);
+  assertEquals(
+    Model.sortFollowers([parked, jbl], "").map((f) => f.name),
+    ["JBL TUNE230NC TWS", "AAA"],
+  );
+  assertEquals(Model.sortFollowers([], ""), []);
+  assertEquals(Model.sortFollowers(null, ""), []);
+});
+
+Deno.test("findByWhich answers for the device an IPC caller named", () => {
+  const followed = [
+    { name: "JBL TUNE230NC TWS", address: "AA:BB:CC:DD:EE:FF" },
+    { name: "WH-CH720N", address: "B0:11:22:33:44:55", controlBackend: "sony" },
+    { name: "Xiaomi Buds 5 Pro", address: "64:8F:DB:87:06:CB", controlBackend: "xiaomi" },
+  ];
+  // The brand is often only in the backend: a Sony calls itself "WH-CH720N".
+  assertEquals(Model.findByWhich(followed, "sony"), 1);
+  assertEquals(Model.findByWhich(followed, "xiaomi"), 2);
+  assertEquals(Model.findByWhich(followed, "buds 5"), 2);
+  // Nothing named is the first device, which is what a no-argument call means.
+  assertEquals(Model.findByWhich(followed, ""), 0);
+  assertEquals(Model.findByWhich(followed, "  "), 0);
+  assertEquals(Model.findByWhich(followed, "jbl"), 0);
+  assertEquals(Model.findByWhich(followed, "ch720"), 1);
+  // The address works as well as the name, and case is nobody's business.
+  assertEquals(Model.findByWhich(followed, "b0:11:22"), 1);
+  assertEquals(Model.findByWhich(followed, "airpods"), -1);
+  assertEquals(Model.findByWhich([], ""), -1);
+  assertEquals(Model.findByWhich(null, "jbl"), -1);
+});
+
+Deno.test("shortError keeps the last line a helper said, trimmed", () => {
+  assertEquals(
+    Model.shortError("Traceback:\n  File x\nModuleNotFoundError: no dbus\n", "fell over"),
+    "ModuleNotFoundError: no dbus",
+  );
+  // Nothing said at all is what the fallback is for.
+  assertEquals(Model.shortError("", "fell over"), "fell over");
+  assertEquals(Model.shortError("   \n\n", "fell over"), "fell over");
+  assertEquals(Model.shortError(null, "fell over"), "fell over");
+  // A panel is not a log: a wall of text is cut and marked as cut.
+  const long = Model.shortError("x".repeat(400), "fell over");
+  assertEquals(long.length, 158);
+  assertEquals(long.slice(-1), "…");
+});
+
+Deno.test("batteryLevel needs a connection and a reported battery", () => {
+  assertEquals(Model.batteryLevel(buds()), 20);
+  assertEquals(Model.batteryLevel(buds({ connected: false })), -1);
+  assertEquals(Model.batteryLevel(buds({ batteryAvailable: false })), -1);
+  assertEquals(Model.batteryLevel(null), -1);
+  // Out-of-range input is clamped rather than trusted.
+  assertEquals(Model.batteryLevel(buds({ battery: 1.4 })), 100);
+  assertEquals(Model.batteryLevel(buds({ battery: -0.2 })), 0);
+  // BatteryAvailable without a Percentage yet: unknown, not zero.
+  assertEquals(Model.batteryLevel({ connected: true, batteryAvailable: true }), -1);
+});
+
+Deno.test("lowestBud ignores a bud that reports nothing", () => {
+  assertEquals(Model.lowestBud(80, 40), 40);
+  assertEquals(Model.lowestBud(-1, 40), 40);
+  assertEquals(Model.lowestBud(80, -1), 80);
+  assertEquals(Model.lowestBud(-1, -1), -1);
+  // The point of the function: a bud in the case must not drag the bar to zero.
+  assertEquals(Model.lowestBud(-1, 90), 90);
+});
+
+Deno.test("levelGlyph walks the ramp and switches on charging", () => {
+  assertEquals(Model.levelGlyph(-1, false), "");
+  assertEquals(Model.levelGlyph(0, false), "\u{f007a}");
+  assertEquals(Model.levelGlyph(100, false), "\u{f0079}");
+  assertEquals(Model.levelGlyph(50, true), "\u{f0089}");
+  // 100 must not index past the end of the ramp.
+  assertEquals(Model.levelGlyph(100, true), "\u{f0085}");
+  // A missing level is not a level: no glyph, and no NaN index into the ramp.
+  assertEquals(Model.levelGlyph(undefined, false), "");
+  assertEquals(Model.levelGlyph(NaN, true), "");
+});
+
+Deno.test("statusLine states the connection and leaves the levels to the rows", () => {
+  const base = { hasDevice: true, connected: true, name: "JBL", level: 40 };
+  assertEquals(Model.statusLine({ ...base, left: 55, right: 40 }), "connected");
+  assertEquals(Model.statusLine({ ...base, left: 55, right: 40, charging: true }), "connected · charging");
+  assertEquals(Model.statusLine({ ...base, left: -1, right: -1, level: 35 }), "connected");
+  assertEquals(Model.statusLine({ ...base, single: true, singleLevel: 97, level: 97 }), "connected");
+  assertEquals(Model.statusLine({ ...base, left: -1, right: -1, level: -1 }), "connected · battery not reported");
+  assertEquals(Model.statusLine({ hasDevice: true, connected: false }), "not connected");
+  assertEquals(Model.statusLine({ hasDevice: false }), "no headphones paired");
+});
+
+Deno.test("tooltip lists only the components that reported", () => {
+  assertEquals(
+    Model.tooltip({
+      hasDevice: true, connected: true, name: "JBL",
+      left: 90, right: 100, caseLevel: 78, level: 90,
+    }),
+    "JBL · L 90% · R 100% · case 78%",
+  );
+  assertEquals(
+    Model.tooltip({
+      hasDevice: true, connected: true, name: "JBL",
+      left: -1, right: -1, caseLevel: -1, level: 20,
+    }),
+    "JBL · 20%",
+  );
+  assertEquals(
+    Model.tooltip({
+      hasDevice: true, connected: true, name: "JBL",
+      left: -1, right: -1, caseLevel: -1, level: -1,
+    }),
+    "JBL · battery unknown",
+  );
+  assertEquals(
+    Model.tooltip({ hasDevice: true, connected: false, name: "JBL" }),
+    "JBL · not connected",
+  );
+  assertEquals(Model.tooltip({ hasDevice: false }), "No headphones paired");
+});
+
+Deno.test("tooltip leads with the set level when only the case reported", () => {
+  // The bug this pins: with both buds silent the bar shows state.level, and the
+  // tooltip used to name the case alone, so the two disagreed on screen.
+  const state = {
+    hasDevice: true, connected: true, name: "JBL",
+    left: -1, right: -1, caseLevel: 78, level: 35,
+  };
+  assertEquals(Model.tooltip(state), "JBL · 35% · case 78%");
+  assertEquals(Model.statusLine(state), "connected");
+});
+
+Deno.test("a headset with one battery is never given a side", () => {
+  // The WH-CH720N sends a one-byte battery payload: one figure for the whole
+  // headset, with no left, no right and no case. It used to arrive as `left`
+  // and read "L 100%", which claims a right earbud that does not exist.
+  const state = {
+    hasDevice: true, connected: true, name: "WH-CH720N",
+    left: -1, right: -1, caseLevel: -1, level: 100,
+    single: true, singleLevel: 100,
+  };
+  assertEquals(Model.singleLevel(state), 100);
+  assertEquals(Model.statusLine(state), "connected");
+  assertEquals(Model.tooltip(state), "WH-CH720N · 100%");
+  assertEquals(Model.lowBatteryBody({ ...state, level: 15, singleLevel: 15 }), "15% left");
+});
+
+Deno.test("singleLevel answers only for a set that says it has one battery", () => {
+  // A pair of earbuds carries no `single`, and a single headset that has not
+  // reported yet carries -1; both mean "no single figure", so callers can ask
+  // one question rather than checking a flag and a number.
+  assertEquals(Model.singleLevel({ single: true, singleLevel: -1 }), -1);
+  assertEquals(Model.singleLevel({ single: false, singleLevel: 90 }), -1);
+  assertEquals(Model.singleLevel({ singleLevel: 90 }), -1);
+  assertEquals(Model.singleLevel({ single: true, singleLevel: "90" }), -1);
+  assertEquals(Model.singleLevel(null), -1);
+  // With the flag off, the per-earbud tooltip wording is untouched.
+  assertEquals(
+    Model.tooltip({
+      hasDevice: true, connected: true, name: "JBL",
+      left: 55, right: 40, level: 40, single: false, singleLevel: -1,
+    }),
+    "JBL · L 55% · R 40%",
+  );
+});
+
+Deno.test("lowBatteryBody says which bud is low", () => {
+  assertEquals(
+    Model.lowBatteryBody({ left: 15, right: 8, level: 8 }),
+    "L 15% · R 8% left",
+  );
+  assertEquals(Model.lowBatteryBody({ left: -1, right: -1, level: 20 }), "20% left");
+  assertEquals(Model.lowBatteryBody({ left: -1, right: -1, level: -1 }), "battery low");
+});
+
+Deno.test("barText writes a percentage only when asked and known", () => {
+  assertEquals(Model.barText(40, true), "\u{f02cb} 40%");
+  assertEquals(Model.barText(40, false), "\u{f02cb}");
+  assertEquals(Model.barText(-1, true), "\u{f02cb}");
+  assertEquals(Model.percentLabel(-1), "—");
+  assertEquals(Model.percentLabel(0), "0%");
+});
+
+Deno.test("mergeReaderLine keeps values the newer line omits", () => {
+  const first = Model.mergeReaderLine({}, '{"stream":true,"modelId":"71f20a","left":90}');
+  assertEquals(first.modelId, "71f20a");
+  // A later battery line carries no modelId; it must survive.
+  const second = Model.mergeReaderLine(first, '{"stream":true,"left":80,"right":70}');
+  assertEquals(second.modelId, "71f20a");
+  assertEquals(second.left, 80);
+  assertEquals(second.right, 70);
+});
+
+Deno.test("mergeReaderLine takes the single-battery line as the reader writes it", () => {
+  const state = Model.mergeReaderLine(
+    {},
+    '{"stream":true,"single":true,"battery":100,"batteryCharging":false,' +
+      '"left":-1,"right":-1,"case":-1,"modelId":"0e4c0a"}',
+  );
+  assertEquals(state.single, true);
+  assertEquals(Model.readerLevel(state, "battery"), 100);
+  // The three component keys stay unknown: the headset measured one battery.
+  assertEquals(Model.readerLevel(state, "left"), -1);
+  assertEquals(Model.readerLevel(state, "right"), -1);
+  assertEquals(Model.readerLevel(state, "case"), -1);
+});
+
+Deno.test("readerLineAddress routes a line to the device it is about", () => {
+  // One reader serves every device, so every line for a device names it.
+  assertEquals(
+    Model.readerLineAddress('{"address":"A0:11:22:33:44:55","stream":true,"left":90}'),
+    "A0:11:22:33:44:55",
+  );
+  // Whatever case it arrives in; the service compares it with BlueZ's.
+  assertEquals(
+    Model.readerLineAddress('{"address":" a0:11:22:33:44:55 ","stream":false,"error":"x"}'),
+    "A0:11:22:33:44:55",
+  );
+  // No address is the reader talking about itself, which is every device's
+  // problem and no device's line.
+  assertEquals(Model.readerLineAddress('{"stream":false,"error":"no system bus"}'), "");
+  assertEquals(Model.readerLineAddress('{"stream":true}'), "");
+  // Junk is unroutable in exactly the same way.
+  assertEquals(Model.readerLineAddress("not json at all"), "");
+  assertEquals(Model.readerLineAddress(""), "");
+  assertEquals(Model.readerLineAddress(null), "");
+  assertEquals(Model.readerLineAddress("[7,8]"), "");
+  assertEquals(Model.readerLineAddress("42"), "");
+  assertEquals(Model.readerLineAddress("null"), "");
+  // An address that is not a string is not an address.
+  assertEquals(Model.readerLineAddress('{"address":7,"stream":true}'), "");
+});
+
+Deno.test("readerAddresses names the devices the one reader is started for", () => {
+  const connected = { address: "A0:11:22:33:44:55", connected: true };
+  const parked = { address: "B0:11:22:33:44:55", connected: false };
+  assertEquals(Model.readerAddresses([connected, parked]), ["A0:11:22:33:44:55"]);
+  // Uppercased, so the address on a line and the address in the follow list are
+  // written the same way.
+  assertEquals(
+    Model.readerAddresses([{ address: "b0:11:22:33:44:55", connected: true }]),
+    ["B0:11:22:33:44:55"],
+  );
+  // A device in its case has no channel to open, and asking BlueZ for one would
+  // connect it behind its owner's back.
+  assertEquals(Model.readerAddresses([parked]), []);
+  assertEquals(Model.readerAddresses([{ address: "", connected: true }]), []);
+  assertEquals(Model.readerAddresses([connected, connected]), ["A0:11:22:33:44:55"]);
+  assertEquals(Model.readerAddresses([null]), []);
+  assertEquals(Model.readerAddresses([]), []);
+  assertEquals(Model.readerAddresses(null), []);
+});
+
+Deno.test("mergeReaderLine carries the address along with the reading", () => {
+  const state = Model.mergeReaderLine(
+    {},
+    '{"address":"A0:11:22:33:44:55","stream":true,"left":90,"right":80}',
+  );
+  assertEquals(state.address, "A0:11:22:33:44:55");
+  // The service routed by it already, so it is only ever the same address; it
+  // survives the error line like the other identifying keys.
+  const down = Model.mergeReaderLine(
+    state,
+    '{"address":"A0:11:22:33:44:55","stream":false,"error":"message stream ended"}',
+  );
+  assertEquals(down.address, "A0:11:22:33:44:55");
+  assertEquals(down.left, 90);
+});
+
+Deno.test("mergeReaderLine survives junk without losing what it had", () => {
+  const state = Model.mergeReaderLine({ left: 90, stream: true }, "not json at all");
+  assertEquals(state.left, 90);
+  assertEquals(state.stream, true);
+  assertEquals(Model.mergeReaderLine({ left: 90 }, "").left, 90);
+  assertEquals(Model.mergeReaderLine({ left: 90 }, null).left, 90);
+  // A JSON array is valid JSON; merging it would add keys "0" and "1".
+  const array = Model.mergeReaderLine({ left: 90 }, "[7,8]");
+  assertEquals(array.left, 90);
+  assertEquals(Object.keys(array), ["left"]);
+  assertEquals(Model.mergeReaderLine({ left: 90 }, "42").left, 90);
+  assertEquals(Object.keys(Model.mergeReaderLine({ left: 90 }, "null")), ["left"]);
+});
+
+Deno.test("parseSupport reads anything that is not an object as no record", () => {
+  assertEquals(Model.parseSupport(""), {});
+  assertEquals(Model.parseSupport("not json"), {});
+  assertEquals(Model.parseSupport("null"), {});
+  assertEquals(Model.parseSupport("[]"), {});
+  assertEquals(Model.parseSupport(null), {});
+  assertEquals(
+    Model.parseSupport('{"71f20a":{"supported":true}}'),
+    { "71f20a": { supported: true } },
+  );
+});
+
+Deno.test("supportVerdict only retires a model the bridge gave up on", () => {
+  // Misses alone are still "not settled": the bridge writes supported:false
+  // itself once it has heard silence often enough.
+  assertEquals(Model.supportVerdict({ "x": { misses: 2 } }, "x"), -1);
+  assertEquals(Model.supportVerdict({ "x": { supported: false } }, "x"), 0);
+  assertEquals(Model.supportVerdict({ "x": { supported: true } }, "x"), 1);
+  // A malformed entry, an empty record and a missing model id all cost a probe.
+  assertEquals(Model.supportVerdict({ "x": true }, "x"), -1);
+  assertEquals(Model.supportVerdict({}, ""), -1);
+  assertEquals(Model.supportVerdict({}, "x"), -1);
+  assertEquals(Model.supportVerdict(null, "x"), -1);
+});
+
+Deno.test("readerLevel treats absent, negative and non-numeric alike", () => {
+  assertEquals(Model.readerLevel({ left: 90 }, "left"), 90);
+  assertEquals(Model.readerLevel({ left: -1 }, "left"), -1);
+  assertEquals(Model.readerLevel({}, "left"), -1);
+  assertEquals(Model.readerLevel({ left: "90" }, "left"), -1);
+  assertEquals(Model.readerLevel(null, "left"), -1);
+  // The single-battery line puts its figure in `battery`, read the same way.
+  assertEquals(Model.readerLevel({ battery: 100 }, "battery"), 100);
+  assertEquals(Model.readerLevel({ battery: -1 }, "battery"), -1);
+});
+
+Deno.test("asBool accepts the strings `omarchy bar set` writes", () => {
+  assertEquals(Model.asBool(false, true), false);
+  assertEquals(Model.asBool(true, false), true);
+  // The case this exists for: a JSON string, which is truthy in QML.
+  assertEquals(Model.asBool("false", true), false);
+  assertEquals(Model.asBool("off", true), false);
+  assertEquals(Model.asBool("0", true), false);
+  assertEquals(Model.asBool("true", false), true);
+  assertEquals(Model.asBool("on", false), true);
+  assertEquals(Model.asBool(0, true), false);
+  assertEquals(Model.asBool(1, false), true);
+  // Anything unrecognised keeps the default rather than guessing.
+  assertEquals(Model.asBool("maybe", true), true);
+  assertEquals(Model.asBool(undefined, true), true);
+  assertEquals(Model.asBool("", false), false);
+});
+
+Deno.test("asInt parses numbers written as strings", () => {
+  assertEquals(Model.asInt(15, 20), 15);
+  assertEquals(Model.asInt("15", 20), 15);
+  assertEquals(Model.asInt("15.6", 20), 16);
+  assertEquals(Model.asInt("nonsense", 20), 20);
+  assertEquals(Model.asInt(undefined, 20), 20);
+  assertEquals(Model.asInt("", 20), 20);
+  // Number("  ") is 0, which as a low-battery threshold would mean "never warn".
+  assertEquals(Model.asInt("  ", 20), 20);
+});
+
+Deno.test("clamp keeps a stepped dial inside its range", () => {
+  assertEquals(Model.clamp(12, 0, 20), 12);
+  // A step off either end stops there rather than asking for 21 or -1.
+  assertEquals(Model.clamp(21, 0, 20), 20);
+  assertEquals(Model.clamp(-1, 0, 20), 0);
+  // The slider hands over a real, and the dial has whole stops only.
+  assertEquals(Model.clamp(12.4, 0, 20), 12);
+  assertEquals(Model.clamp(12.5, 0, 20), 13);
+  assertEquals(Model.clamp("8", 0, 20), 8);
+  assertEquals(Model.clamp("nonsense", 0, 20), 0);
+  assertEquals(Model.clamp(undefined, 0, 20), 0);
+});
+
+Deno.test("uuidsFromBluetoothctl reads the UUID lines and nothing else", () => {
+  const info = [
+    "Device B0:11:22:33:44:55 (public)",
+    "\tName: WH-CH720N",
+    "\tIcon: audio-headset",
+    "\tUUID: Headset                   (00001108-0000-1000-8000-00805f9b34fb)",
+    "\tUUID: Vendor specific           (956C7B26-D49A-4BA8-B03F-B17D393CB6E2)",
+    "\tModalias: usb:v054Cp0EAFd0112",
+    "\tBattery Percentage: 0x64 (100)",
+  ].join("\n");
+  assertEquals(Model.uuidsFromBluetoothctl(info), [
+    "00001108-0000-1000-8000-00805f9b34fb",
+    "956c7b26-d49a-4ba8-b03f-b17d393cb6e2",
+  ]);
+  // A failed probe, and a device that lists none, both read as "nothing seen".
+  assertEquals(Model.uuidsFromBluetoothctl(""), []);
+  assertEquals(Model.uuidsFromBluetoothctl(null), []);
+  assertEquals(
+    Model.uuidsFromBluetoothctl("Device 00:11:22:33:44:55 not available"),
+    [],
+  );
+});
+
+Deno.test("controlBackend picks the protocol the device advertises", () => {
+  const sony = ["0000110b-0000-1000-8000-00805f9b34fb", Model.SONY_MDR_V2_UUID];
+  // The SDP record is the stronger statement: a Sony headset that also happens
+  // to have a Fast Pair address is still driven over its own channel.
+  assertEquals(Model.controlBackend(sony, ""), "sony");
+  assertEquals(Model.controlBackend(sony, "48:B4:41:00:00:01"), "sony");
+  // bluetoothctl prints them lowercase, but nothing guarantees it.
+  assertEquals(Model.controlBackend([Model.SONY_MDR_V2_UUID.toUpperCase()], ""), "sony");
+  // CSR GAIA in the SDP record is Xiaomi / QCC on SPP, and beats a BLE address
+  // the same way Sony does: the UUID is the device's own claim.
+  const xiaomi = [
+    "00001101-0000-1000-8000-00805f9b34fb",
+    Model.CSR_GAIA_UUID,
+  ];
+  assertEquals(Model.controlBackend(xiaomi, ""), "xiaomi");
+  assertEquals(Model.controlBackend(xiaomi, "48:B4:41:00:00:01"), "xiaomi");
+  assertEquals(Model.controlBackend([Model.CSR_GAIA_UUID.toUpperCase()], ""), "xiaomi");
+  // Soundcore vendor UUID in SDP record picks soundcore backend.
+  const soundcore = [
+    "00001101-0000-1000-8000-00805f9b34fb",
+    "0cf12d31-fac3-4553-bd80-d6832e7d1402",
+  ];
+  assertEquals(Model.controlBackend(soundcore, ""), "soundcore");
+  assertEquals(Model.controlBackend(soundcore, "48:B4:41:00:00:01"), "soundcore");
+  assertEquals(Model.controlBackend(["0CF12D31-FAC3-4553-BD80-D6832E7D1402"], ""), "soundcore");
+  // Samsung's own UUID gets its own bridge instead of falling through to JBL.
+  const samsung = [
+    "00001101-0000-1000-8000-00805f9b34fb",
+    Model.SAMSUNG_SPP_UUID,
+  ];
+  assertEquals(Model.controlBackend(samsung, ""), "samsung");
+  assertEquals(Model.controlBackend(samsung, "48:B4:41:00:00:01"), "samsung");
+  assertEquals(Model.controlBackend([Model.SAMSUNG_SPP_UUID.toUpperCase()], ""), "samsung");
+  // Sony still wins when both vendor UUIDs are listed.
+  assertEquals(
+    Model.controlBackend([Model.CSR_GAIA_UUID, Model.SONY_MDR_V2_UUID], ""),
+    "sony",
+  );
+  // No Sony, GAIA or Soundcore UUID: the BLE address from the Message Stream is what is left.
+  assertEquals(Model.controlBackend([], "48:B4:41:00:00:01"), "jbl");
+  assertEquals(Model.controlBackend(null, "48:B4:41:00:00:01"), "jbl");
+  // Nothing to reach the device with.
+  assertEquals(Model.controlBackend([], ""), "");
+  assertEquals(Model.controlBackend(null, ""), "");
+  assertEquals(Model.controlBackend([], "   "), "");
+});
+
+Deno.test("either Sony MDR UUID reaches the sony bridge", () => {
+  const v1 = ["0000110b-0000-1000-8000-00805f9b34fb", Model.SONY_MDR_V1_UUID];
+  assertEquals(Model.controlBackend(v1, ""), "sony");
+  assertEquals(Model.controlBackend([Model.SONY_MDR_V1_UUID.toUpperCase()], ""), "sony");
+  assertEquals(Model.controlBackend(v1, "48:B4:41:00:00:01"), "sony");
+});
+
+Deno.test("sonyUuidFor hands the bridge the generation to register", () => {
+  assertEquals(Model.sonyUuidFor([Model.SONY_MDR_V2_UUID]), Model.SONY_MDR_V2_UUID);
+  assertEquals(Model.sonyUuidFor([Model.SONY_MDR_V1_UUID]), Model.SONY_MDR_V1_UUID);
+  // Case and neighbours in the record change nothing.
+  assertEquals(
+    Model.sonyUuidFor(["0000110b-0000-1000-8000-00805f9b34fb",
+                       Model.SONY_MDR_V1_UUID.toUpperCase()]),
+    Model.SONY_MDR_V1_UUID,
+  );
+  // Both listed: v2 is what the working Sonys are connected on, whichever
+  // order the record prints them in.
+  assertEquals(
+    Model.sonyUuidFor([Model.SONY_MDR_V1_UUID, Model.SONY_MDR_V2_UUID]),
+    Model.SONY_MDR_V2_UUID,
+  );
+  assertEquals(
+    Model.sonyUuidFor([Model.SONY_MDR_V2_UUID, Model.SONY_MDR_V1_UUID]),
+    Model.SONY_MDR_V2_UUID,
+  );
+  // Not a Sony, and nothing at all.
+  assertEquals(Model.sonyUuidFor([Model.CSR_GAIA_UUID]), "");
+  assertEquals(Model.sonyUuidFor([]), "");
+  assertEquals(Model.sonyUuidFor(null), "");
+});
+
+// Whenever controlBackend says "sony", there is a UUID to hand the bridge —
+// DeviceFollower.qml passes one without checking, and an empty one would send
+// the bridge an argument it rejects.
+Deno.test("a sony device always has a UUID to register", () => {
+  for (const uuid of [Model.SONY_MDR_V2_UUID, Model.SONY_MDR_V1_UUID]) {
+    assertEquals(Model.controlBackend([uuid], ""), "sony");
+    assertEquals(Model.sonyUuidFor([uuid]) !== "", true);
+  }
+});
+
+// What DeviceFollower.qml used to decide by comparing controlBackend with a
+// brand's name now comes from the rows. Each answer is the one the old check
+// gave, row by row, so no device is sent anything different.
+Deno.test("the rows answer what the follower once asked by brand name", () => {
+  for (const row of Model.BACKENDS) {
+    assertEquals(Model.isBleBackend(row.name), row.name === "jbl", row.name);
+    assertEquals(Model.hasAmbientDial(row.name), row.name === "sony" || row.name === "soundcore" || row.name === "airoha", row.name);
+    const command = { sony: "voice", soundcore: "wind" }[row.name] || "";
+    assertEquals(Model.ambientRange(row.name).command, command, row.name);
+    // The airoha row has a dial and no switch: an empty key and label.
+    const key = row.name === "soundcore" ? "Wind" : row.name === "airoha" ? "" : "Voice";
+    assertEquals(Model.ambientRange(row.name).key, key, row.name);
+    if (row.name !== "sony")
+      assertEquals(Model.bridgeUuid(row.name, [Model.SONY_MDR_V2_UUID, ...(row.uuids || [])]), "", row.name);
+  }
+  for (const name of ["", "nonesuch"]) {
+    assertEquals(Model.isBleBackend(name), false);
+    assertEquals(Model.hasAmbientDial(name), false);
+    assertEquals(Model.ambientRange(name).command, "");
+    assertEquals(Model.bridgeUuid(name, [Model.SONY_MDR_V2_UUID]), "");
+  }
+  assertEquals(Model.bridgeUuid("sony", [Model.SONY_MDR_V1_UUID, Model.SONY_MDR_V2_UUID]), Model.SONY_MDR_V2_UUID);
+  assertEquals(Model.bridgeUuid("sony", [" " + Model.SONY_MDR_V1_UUID.toUpperCase()]), Model.SONY_MDR_V1_UUID);
+  assertEquals(Model.bridgeUuid("sony", [Model.CSR_GAIA_UUID]), "");
+});
+
+Deno.test("modesAvailable defaults to the JBL four and filters what Sony names", () => {
+  // The JBL bridge names none: its protocol has one fixed set of slots.
+  assertEquals(Model.modesAvailable({ modes: true, mode: "anc" }), [
+    "off", "anc", "ambient", "talkthru",
+  ]);
+  assertEquals(Model.modesAvailable({}), ["off", "anc", "ambient", "talkthru"]);
+  assertEquals(Model.modesAvailable(null), ["off", "anc", "ambient", "talkthru"]);
+  // A Sony over-ear, in the panel's fixed order rather than the line's.
+  assertEquals(
+    Model.modesAvailable({ available: ["ambient", "off", "anc"] }),
+    ["off", "anc", "ambient"],
+  );
+  // Names neither bridge should send are dropped, not drawn.
+  assertEquals(Model.modesAvailable({ available: ["off", "wind"] }), ["off"]);
+  // An explicit empty list means "offers nothing", which hides the row — very
+  // different from a line that never mentioned the subject.
+  assertEquals(Model.modesAvailable({ available: [] }), []);
+});
+
+Deno.test("a device-authored name can never read as rich text", () => {
+  assertEquals(
+    Model.deviceLabel({ name: '<img src="http://evil/x.png">' }),
+    "‹img src=\"http://evil/x.png\"›",
+  );
+  assertEquals(
+    Model.deviceLabel({ name: "", deviceName: "<b>Buds</b>" }),
+    "‹b›Buds‹/b›",
+  );
+  assertEquals(Model.deviceLabel({ name: "JBL <3" }), "JBL ‹3");
+});
+
+Deno.test("shortError neutralises markup a helper quoted", () => {
+  assertEquals(
+    Model.shortError("boom: <img src=x>\n", "fallback"),
+    "boom: ‹img src=x›",
+  );
+});
+
+Deno.test("controlBackend picks nothing from the NT Link UUID", () => {
+  const nothing = ["0000110b-0000-1000-8000-00805f9b34fb", Model.NOTHING_NT_LINK_UUID];
+  assertEquals(Model.controlBackend(nothing, ""), "nothing");
+  // A Fast Pair address does not outrank the device's own record.
+  assertEquals(Model.controlBackend(nothing, "48:B4:41:00:00:01"), "nothing");
+  assertEquals(Model.controlBackend([Model.NOTHING_NT_LINK_UUID.toUpperCase()], ""), "nothing");
+  // Sony still wins; GAIA loses to Nothing the same way it loses to Sony.
+  assertEquals(
+    Model.controlBackend([Model.NOTHING_NT_LINK_UUID, Model.SONY_MDR_V2_UUID], ""),
+    "sony",
+  );
+  assertEquals(
+    Model.controlBackend([Model.CSR_GAIA_UUID, Model.NOTHING_NT_LINK_UUID], ""),
+    "nothing",
+  );
+  assertEquals(Model.isClassicBackend("nothing"), true);
+  assertEquals(Model.isClassicBackend("sony"), true);
+  assertEquals(Model.isClassicBackend("samsung"), true);
+  assertEquals(Model.isClassicBackend("xiaomi"), true);
+  assertEquals(Model.isClassicBackend("soundcore"), true);
+  assertEquals(Model.isClassicBackend("jbl"), false);
+  assertEquals(Model.isClassicBackend(""), false);
+});
+
+Deno.test("ancLevelsAvailable is empty unless the bridge graded the noise cancelling", () => {
+  // The JBL and Sony bridges never mention strengths: no row.
+  assertEquals(Model.ancLevelsAvailable({ modes: true, mode: "anc" }), []);
+  assertEquals(Model.ancLevelsAvailable({}), []);
+  assertEquals(Model.ancLevelsAvailable(null), []);
+  // The Nothing bridge's four, in the panel's order rather than the line's.
+  assertEquals(
+    Model.ancLevelsAvailable({ ancLevels: ["adaptive", "high", "low", "mid"] }),
+    ["low", "mid", "high", "adaptive"],
+  );
+  assertEquals(Model.ancLevelsAvailable({ ancLevels: ["high", "wind"] }), ["high"]);
+  assertEquals(Model.ancLevelsAvailable({ ancLevels: [] }), []);
+});
+
+Deno.test("ancLevel names only a strength the panel can draw", () => {
+  assertEquals(Model.ancLevel({ ancLevel: "high" }), "high");
+  assertEquals(Model.ancLevel({ ancLevel: "adaptive" }), "adaptive");
+  assertEquals(Model.ancLevel({ ancLevel: "loud" }), "");
+  assertEquals(Model.ancLevel({}), "");
+  assertEquals(Model.ancLevel(null), "");
+});
+
+Deno.test("bridge battery reads what the line carried and nothing more", () => {
+  const line = {
+    modes: true,
+    battery: { left: 85, right: 15, case: 85, charging: ["case"], caseStale: true },
+  };
+  assertEquals(Model.bridgeLevel(line, "left"), 85);
+  assertEquals(Model.bridgeLevel(line, "right"), 15);
+  assertEquals(Model.bridgeLevel(line, "case"), 85);
+  // Not mentioned is not reported.
+  assertEquals(Model.bridgeLevel(line, "headset"), -1);
+  assertEquals(Model.bridgeCharging(line, "case"), true);
+  assertEquals(Model.bridgeCharging(line, "left"), false);
+  assertEquals(Model.bridgeCaseStale(line), true);
+  // Out-of-range and non-numbers are "not reported", not clamped.
+  assertEquals(Model.bridgeLevel({ battery: { left: 130 } }, "left"), -1);
+  assertEquals(Model.bridgeLevel({ battery: { left: "85" } }, "left"), -1);
+  assertEquals(Model.bridgeLevel({ battery: { left: -1 } }, "left"), -1);
+  // A line with no battery, an array, or no line at all.
+  assertEquals(Model.bridgeLevel({ modes: true, mode: "anc" }, "left"), -1);
+  assertEquals(Model.bridgeLevel({ battery: [85] }, "0"), -1);
+  assertEquals(Model.bridgeLevel(null, "left"), -1);
+  assertEquals(Model.bridgeCharging(null, "left"), false);
+  assertEquals(Model.bridgeCaseStale({ battery: { case: 50 } }), false);
+  assertEquals(Model.bridgeCaseStale(null), false);
+});
+
+// ---- BACKENDS: the brand table the shell reads instead of a chain of ifs.
+
+Deno.test("every backend row names a bridge that exists, with a test file and a pin", () => {
+  const root = new URL("../", import.meta.url);
+  for (const row of Model.BACKENDS) {
+    assertEquals(typeof row.name, "string", "name");
+    // A row is named after its bridge, except a second row for a bridge that
+    // must be started differently for one model (redmi-buds-3-pro, which needs
+    // the name the Buds 5's row does not pass): it is named after that model.
+    const brand = row.bridge.replace(/-bridge$/, "");
+    assertEquals(row.name === brand || row.name.startsWith(brand + "-"), true,
+      row.name + ": bridge file name");
+    assertEquals(Deno.statSync(new URL(row.bridge, root)).isFile, true, row.bridge);
+    assertEquals(
+      Deno.statSync(new URL("tests/" + brand + "_bridge_test.py", root)).isFile,
+      true,
+      row.name + " test file",
+    );
+    const pins = [...Deno.readDirSync(new URL("tests/pins/" + brand + "/", root))]
+      .filter((entry) => entry.name.endsWith(".json"));
+    assertEquals(pins.length > 0, true, row.name + " has a pin");
+    assertEquals(Array.isArray(row.args), true, row.name + " args");
+    assertEquals(!!row.ble || !!row.uuids || !!row.uuidPrefix || !!row.modelNames, true, row.name + " claims something");
+  }
+});
+
+Deno.test("no two backend rows claim the same UUID, and each row's claim picks that row", () => {
+  const seen = new Map();
+  for (const row of Model.BACKENDS) {
+    for (const id of row.uuids || []) {
+      assertEquals(seen.has(id), false, id + " claimed by " + seen.get(id) + " and " + row.name);
+      seen.set(id, row.name);
+      // Alone, and next to a Fast Pair address, which must not outrank it.
+      assertEquals(Model.controlBackend([id], ""), row.name);
+      assertEquals(Model.controlBackend([id], "48:B4:41:00:00:01"), row.name);
+    }
+    if (row.uuidPrefix) {
+      assertEquals(Model.controlBackend([row.uuidPrefix + "d1402"], "48:B4:41:00:00:01"), row.name);
+    }
+  }
+  assertEquals(Model.controlBackend([], "48:B4:41:00:00:01"), "jbl");
+  assertEquals(Model.controlBackend([], ""), "");
+});
+
+// The SDP records of devices that work today. The Xiaomi list is the one
+// PROTOCOL.md prints from bluetoothctl; the other three are put together from
+// the UUIDs PROTOCOL.md names for the device plus the standard audio profiles,
+// not copied from a printout. A new brand's claim must leave each of these
+// where it is. Add your device's list — the real one, from `bluetoothctl info`
+// — with your row.
+const DEVICES = [
+  {
+    model: "Xiaomi Buds 5 Pro",
+    backend: "xiaomi",
+    uuids: [
+      "00001100-d102-11e1-9b23-00025b00a5a5",
+      "00001101-0000-1000-8000-00805f9b34fb",
+      "00000837-d103-0004-bf7f-2942153d354b",
+      "2587db3c-ce70-4fc9-935f-777ab4188fd7",
+    ],
+    bleAddress: "",
+  },
+  {
+    model: "Samsung Galaxy Buds2",
+    backend: "samsung",
+    uuids: [
+      "0000110b-0000-1000-8000-00805f9b34fb",
+      "0000111e-0000-1000-8000-00805f9b34fb",
+      "df21fe2c-2515-4fdb-8886-f12c4d67927c",
+      "2e73a4ad-332d-41fc-90e2-16bef06523f2",
+    ],
+    bleAddress: "48:B4:41:00:00:01",
+  },
+  {
+    model: "Nothing Ear (a)",
+    backend: "nothing",
+    uuids: [
+      "0000110b-0000-1000-8000-00805f9b34fb",
+      "df21fe2c-2515-4fdb-8886-f12c4d67927c",
+      "aeac4a03-dff5-498f-843a-34487cf133eb",
+    ],
+    bleAddress: "48:B4:41:00:00:01",
+  },
+  {
+    // The real list from `bluetoothctl info`, @adilahmad17's headphones. Two
+    // vendor UUIDs (0000fdb3-… and the 66666666-… placeholder Nothing ships)
+    // that no row claims, alongside NT Link; the standard audio profiles fill
+    // the rest. Same backend as the earbuds, a different RFCOMM channel.
+    model: "CMF Headphone Pro",
+    backend: "nothing",
+    uuids: [
+      "00001000-0000-1000-8000-00805f9b34fb",
+      "00001101-0000-1000-8000-00805f9b34fb",
+      "0000110b-0000-1000-8000-00805f9b34fb",
+      "0000110c-0000-1000-8000-00805f9b34fb",
+      "0000110d-0000-1000-8000-00805f9b34fb",
+      "0000110e-0000-1000-8000-00805f9b34fb",
+      "0000110f-0000-1000-8000-00805f9b34fb",
+      "0000111e-0000-1000-8000-00805f9b34fb",
+      "00001200-0000-1000-8000-00805f9b34fb",
+      "00001203-0000-1000-8000-00805f9b34fb",
+      "00001800-0000-1000-8000-00805f9b34fb",
+      "00001801-0000-1000-8000-00805f9b34fb",
+      "0000fdb3-3817-47d9-a10a-1f6656618f8e",
+      "66666666-6666-6666-6666-666666666666",
+      "aeac4a03-dff5-498f-843a-34487cf133eb",
+      "df21fe2c-2515-4fdb-8886-f12c4d67927c",
+    ],
+    bleAddress: "48:B4:41:00:00:01",
+  },
+  {
+    model: "Bose QC45",
+    backend: "bose",
+    // The real list from `bluetoothctl info AC:BF:71:64:56:B9`. BMAP is
+    // served on a raw RFCOMM channel the record does not name; the two vendor
+    // UUIDs are what claims the device. The deca-fade one's own channel
+    // speaks an iAP2-style DETECT prelude, not BMAP, so the bridge probes.
+    uuids: [
+      "00000000-deca-fade-deca-deafdecacaff",
+      "00001101-0000-1000-8000-00805f9b34fb",
+      "00001108-0000-1000-8000-00805f9b34fb",
+      "0000110a-0000-1000-8000-00805f9b34fb",
+      "0000110b-0000-1000-8000-00805f9b34fb",
+      "0000110c-0000-1000-8000-00805f9b34fb",
+      "0000110d-0000-1000-8000-00805f9b34fb",
+      "0000110e-0000-1000-8000-00805f9b34fb",
+      "0000110f-0000-1000-8000-00805f9b34fb",
+      "0000111e-0000-1000-8000-00805f9b34fb",
+      "0000112e-0000-1000-8000-00805f9b34fb",
+      "00001130-0000-1000-8000-00805f9b34fb",
+      "00001131-0000-1000-8000-00805f9b34fb",
+      "00001200-0000-1000-8000-00805f9b34fb",
+      "9b26d8c0-a8ed-440b-95b0-c4714a518bcc",
+    ],
+    bleAddress: "48:B4:41:00:00:01",
+  },
+  {
+    model: "Bose QC35",
+    backend: "bose",
+    // The real list from docs/captures/bose-qc35.txt. Only the deca-fade
+    // placeholder claims it; unlike the QC45 it serves no 9b26d8c0 SPP UUID.
+    uuids: [
+      "00000000-deca-fade-deca-deafdecacaff",
+      "00001101-0000-1000-8000-00805f9b34fb",
+      "00001108-0000-1000-8000-00805f9b34fb",
+      "0000110a-0000-1000-8000-00805f9b34fb",
+      "0000110b-0000-1000-8000-00805f9b34fb",
+      "0000110c-0000-1000-8000-00805f9b34fb",
+      "0000110d-0000-1000-8000-00805f9b34fb",
+      "0000110e-0000-1000-8000-00805f9b34fb",
+      "0000110f-0000-1000-8000-00805f9b34fb",
+      "0000111e-0000-1000-8000-00805f9b34fb",
+      "0000112e-0000-1000-8000-00805f9b34fb",
+      "00001130-0000-1000-8000-00805f9b34fb",
+      "00001131-0000-1000-8000-00805f9b34fb",
+      "00001200-0000-1000-8000-00805f9b34fb",
+    ],
+    bleAddress: "48:B4:41:00:00:01",
+  },
+  {
+    model: "Sony WH-1000XM4",
+    backend: "sony",
+    uuids: [
+      "0000110b-0000-1000-8000-00805f9b34fb",
+      "df21fe2c-2515-4fdb-8886-f12c4d67927c",
+      "96cc203e-5068-46ad-b32d-e316f5e069ba",
+    ],
+    bleAddress: "48:B4:41:00:00:01",
+  },
+];
+
+Deno.test("the devices that work today still get their backend", () => {
+  for (const device of DEVICES) {
+    assertEquals(Model.controlBackend(device.uuids, device.bleAddress), device.backend, device.model);
+  }
+});
+
+Deno.test("isClassicBackend is every row but the BLE one", () => {
+  for (const row of Model.BACKENDS) {
+    assertEquals(Model.isClassicBackend(row.name), !row.ble, row.name);
+  }
+});
+
+Deno.test("bridgeFor names the row's file, and nothing for a backend with no row", () => {
+  assertEquals(Model.bridgeFor("sony"), "sony-bridge");
+  assertEquals(Model.bridgeFor("jbl"), "jbl-bridge");
+  assertEquals(Model.bridgeFor(""), "");
+  assertEquals(Model.bridgeFor("nope"), "");
+  assertEquals(Model.bridgeFor(null), "");
+});
+
+Deno.test("bridgeArgs is what each bridge was always sent", () => {
+  const known = {
+    address: "94:DB:56:D0:F0:F0",
+    uuid: Model.SONY_MDR_V1_UUID,
+    name: "WH-1000XM4",
+    bleAddress: "48:B4:41:00:00:01",
+    modelId: "0x1234",
+  };
+  // sony-bridge: address, the MDR generation, the reported name.
+  assertEquals(Model.bridgeArgs("sony", known), ["94:DB:56:D0:F0:F0", Model.SONY_MDR_V1_UUID, "WH-1000XM4"]);
+  // No name known yet is "" — the nameless caller sony-bridge treats as the
+  // old one — never a missing argument.
+  assertEquals(
+    Model.bridgeArgs("sony", { address: "94:DB:56:D0:F0:F0", uuid: Model.SONY_MDR_V2_UUID }),
+    ["94:DB:56:D0:F0:F0", Model.SONY_MDR_V2_UUID, ""],
+  );
+  // Nothing now receives the reported name for channel selection.
+  assertEquals(Model.bridgeArgs("nothing", { address: known.address, name: "CMF Headphone Pro" }),
+    [known.address, "CMF Headphone Pro"]);
+  assertEquals(Model.bridgeArgs("nothing", { address: known.address, name: "Nothing Ear (a)" }),
+    [known.address, "Nothing Ear (a)"]);
+  assertEquals(Model.bridgeArgs("nothing", { address: known.address }), [known.address, ""]);
+  // Every other classic bridge: the address alone.
+  for (const name of ["samsung", "xiaomi", "soundcore", "oppo"]) {
+    assertEquals(Model.bridgeArgs(name, known), ["94:DB:56:D0:F0:F0"], name);
+  }
+  // jbl-bridge: the BLE address and the Fast Pair model.
+  assertEquals(Model.bridgeArgs("jbl", known), ["48:B4:41:00:00:01", "0x1234"]);
+  assertEquals(Model.bridgeArgs("jbl", { bleAddress: "48:B4:41:00:00:01" }), ["48:B4:41:00:00:01", ""]);
+  assertEquals(Model.bridgeArgs("", known), []);
+  assertEquals(Model.bridgeArgs("nope", known), []);
+});
+
+Deno.test("ambientRange is Soundcore's dial on Soundcore and Sony's everywhere else", () => {
+  assertEquals(Model.ambientRange("soundcore"),
+    { min: 1, max: 5, voice: "Wind noise reduction", command: "wind", key: "Wind" });
+  assertEquals(Model.ambientRange("sony"),
+    { min: 0, max: 20, voice: "Focus on voice", command: "voice", key: "Voice" });
+  for (const name of ["jbl", "nothing", "xiaomi", "samsung", "oppo", "", "nope"]) {
+    assertEquals(Model.ambientRange(name),
+      { min: 0, max: 20, voice: "Focus on voice", command: "", key: "Voice" }, name);
+  }
+});
+
+Deno.test("controlBackend picks oppo from the HeyMelody UUID", () => {
+  const oppo = ["00001101-0000-1000-8000-00805f9b34fb", Model.OPPO_HEYMELODY_UUID];
+  assertEquals(Model.controlBackend(oppo, ""), "oppo");
+  // A Fast Pair address does not outrank the device's own record.
+  assertEquals(Model.controlBackend(oppo, "48:B4:41:00:00:01"), "oppo");
+  assertEquals(Model.controlBackend([Model.OPPO_HEYMELODY_UUID.toUpperCase()], ""), "oppo");
+  // Every earlier backend wins over it; it wins over the JBL fallback.
+  assertEquals(
+    Model.controlBackend([Model.OPPO_HEYMELODY_UUID, Model.SONY_MDR_V2_UUID], ""),
+    "sony",
+  );
+  assertEquals(
+    Model.controlBackend([Model.SAMSUNG_SPP_UUID, Model.OPPO_HEYMELODY_UUID], ""),
+    "samsung",
+  );
+  assertEquals(
+    Model.controlBackend([Model.NOTHING_NT_LINK_UUID, Model.OPPO_HEYMELODY_UUID], ""),
+    "nothing",
+  );
+  assertEquals(
+    Model.controlBackend([Model.CSR_GAIA_UUID, Model.OPPO_HEYMELODY_UUID], ""),
+    "xiaomi",
+  );
+  assertEquals(Model.controlBackend([Model.OPPO_HEYMELODY_UUID, Model.SOUNDCORE_UUID_PREFIX + "d1402"], ""), "soundcore");
+  assertEquals(Model.isClassicBackend("oppo"), true);
+});
+
+// Canonical owner records: complete bluetoothctl output, not a guessed UUID list.
+const canonical = JSON.parse(await Deno.readTextFile(new URL('fixtures/canonical.json', import.meta.url)));
+// The Life Q30's own record, as bluetoothctl printed it: the complete list,
+// not a hand-picked pair. Its vendor UUID carries the brand prefix with the
+// model's own tail, and nothing else in the record may take the device first.
+Deno.test('captured Life Q30 record selects the soundcore bridge', async () => {
+  const record = await Deno.readTextFile(
+    new URL('../docs/captures/soundcore-life-q30-bluetoothctl.txt', import.meta.url));
+  const ids = Model.uuidsFromBluetoothctl(record);
+  assertEquals(ids.length, 8, 'complete captured UUID list');
+  assertEquals(Model.controlBackend(ids, ''), 'soundcore');
+  assertEquals(Model.controlBackend([...ids].reverse(), ''), 'soundcore');
+  assertEquals(Model.controlBackend(ids.map(id => id.toUpperCase()), ''), 'soundcore');
+  assertEquals(Model.bridgeArgs('soundcore', { address: '88:0E:85:5F:64:B4' }),
+               ['88:0E:85:5F:64:B4']);
+});
+
+Deno.test('captured QCY H3 record selects no control backend', async () => {
+  const record = await Deno.readTextFile(
+    new URL('../docs/captures/qcy-h3-bluetoothctl.txt', import.meta.url));
+  const ids = Model.uuidsFromBluetoothctl(record);
+  assertEquals(Model.controlBackend(ids, ''), '');
+});
+
+Deno.test('canonical Sony and JBL SDP records select their own bridge', async () => {
+  for (const [brand, fixture] of Object.entries(canonical)) {
+    const record = await Deno.readTextFile(new URL('../' + fixture.uuid_capture, import.meta.url));
+    const ids = Model.uuidsFromBluetoothctl(record);
+    const expectedCount = brand === 'sony' ? 30 : 16;
+    assertEquals(ids.length, expectedCount, brand + ': complete captured UUID list');
+    const ble = fixture.gfps.ble.hex.split(' ').slice(4).join(':').toUpperCase();
+    assertEquals(Model.controlBackend(ids, ble), brand);
+    assertEquals(Model.controlBackend([...ids].reverse(), ble), brand);
+    assertEquals(Model.controlBackend(ids.map(id => id.toUpperCase()), ble), brand);
+    assertEquals(Model.controlBackend(ids, ''), brand === 'sony' ? 'sony' : '');
+    assertEquals(Model.bridgeArgs(brand, {
+      address: fixture.address, uuid: Model.SONY_MDR_V2_UUID, name: 'WH-CH720N',
+      bleAddress: ble, modelId: '71f20a',
+    }), brand === 'sony'
+      ? [fixture.address, Model.SONY_MDR_V2_UUID, 'WH-CH720N']
+      : [ble, '71f20a']);
+  }
+});
+
+Deno.test("CMF Buds 2 complete owner SDP selects Nothing and passes reported name", async () => {
+  const record = await Deno.readTextFile(new URL(
+    "../docs/captures/nothing-cmf-buds-2-bluetoothctl.txt", import.meta.url));
+  const ids = Model.uuidsFromBluetoothctl(record);
+  assertEquals(ids.length, 18);
+  for (const uuids of [ids, [...ids].reverse(), ids.map(id => id.toUpperCase())]) {
+    for (const ble of ["", "48:B4:41:00:00:01"]) {
+      assertEquals(Model.controlBackend(uuids, ble), "nothing");
+    }
+  }
+  assertEquals(Model.bridgeArgs("nothing", {
+    address: "3C:B0:ED:D0:AC:0B", name: "CMF Buds 2",
+  }), ["3C:B0:ED:D0:AC:0B", "CMF Buds 2"]);
+});
+
+Deno.test("WH-CH520 owner SDP retains Sony routing for battery-only handling", async () => {
+  const record = await Deno.readTextFile(new URL(
+    "../docs/captures/sony-wh-ch520-bluetoothctl.txt", import.meta.url));
+  const ids = Model.uuidsFromBluetoothctl(record);
+  assertEquals(ids.length, 13);
+  for (const uuids of [ids, [...ids].reverse(), ids.map(id => id.toUpperCase())]) {
+    assertEquals(Model.controlBackend(uuids, ""), "sony");
+    assertEquals(Model.controlBackend(uuids, "44:51:D3:80:51:63"), "sony");
+    assertEquals(Model.sonyUuidFor(uuids), Model.SONY_MDR_V2_UUID);
+  }
+  assertEquals(Model.bridgeArgs("sony", {
+    address: "E8:9E:13:CF:9A:71", uuid: Model.SONY_MDR_V2_UUID, name: "WH-CH520",
+  }), ["E8:9E:13:CF:9A:71", Model.SONY_MDR_V2_UUID, "WH-CH520"]);
+});
+
+Deno.test("NC9 Pro routing requires its reported name and observed service", async () => {
+  const record = await Deno.readTextFile(
+    new URL("../docs/captures/tozo-nc9-pro-bluetoothctl.txt", import.meta.url));
+  const ids = Model.uuidsFromBluetoothctl(record);
+  assertEquals(ids.length, 9);
+  assertEquals(Model.controlBackend([...ids].reverse(), "", "TOZO NC9 Pro"), "tozo");
+  assertEquals(Model.controlBackend(ids.map(id => id.toUpperCase()), "", "TOZO NC9 Pro"), "tozo");
+  assertEquals(Model.controlBackend(ids, "", "TOZO NC9 Pro"), "tozo");
+  assertEquals(Model.controlBackend(ids, "", "Someone else's SPP headphones"), "");
+  assertEquals(Model.controlBackend(ids, "", "TOZO NC9 Pro Box"), "");
+  assertEquals(Model.controlBackend(ids, ""), "");
+  assertEquals(Model.controlBackend([], "", "TOZO NC9 Pro"), "");
+  assertEquals(Model.controlBackend([Model.SONY_MDR_V2_UUID, ...ids], "", "TOZO NC9 Pro"), "sony");
+  assertEquals(Model.controlBackend(["0000b610-0000-1000-8000-00805f9b34fb"], "", "TOZO NC9 Pro"), "tozo");
+  assertEquals(Model.bridgeArgs("tozo", {address:"94:4B:F8:C1:5F:98", name:"TOZO NC9 Pro"}),
+    ["94:4B:F8:C1:5F:98", "TOZO NC9 Pro"]);
+});
+
+Deno.test("FreeBuds SE 2 routing requires its reported name and its SPP service", async () => {
+  const record = await Deno.readTextFile(
+    new URL("../docs/captures/huawei-freebuds-se-2-bluetoothctl.txt", import.meta.url));
+  const ids = Model.uuidsFromBluetoothctl(record);
+  assertEquals(ids.length, 12, "complete captured UUID list");
+  const name = "HUAWEI FreeBuds SE 2";
+  for (const uuids of [ids, [...ids].reverse(), ids.map(id => id.toUpperCase())]) {
+    assertEquals(Model.controlBackend(uuids, "", name), "huawei");
+  }
+  // The record alone claims nothing: plain SPP is on half the headsets here.
+  assertEquals(Model.controlBackend(ids, ""), "");
+  assertEquals(Model.controlBackend(ids, "", "HUAWEI FreeBuds SE"), "");
+  assertEquals(Model.controlBackend([], "", name), "");
+  // Every brand with a claim of its own still wins.
+  assertEquals(Model.controlBackend([Model.SONY_MDR_V2_UUID, ...ids], "", name), "sony");
+  // The TOZO row is untouched by the shared SPP UUID.
+  assertEquals(Model.controlBackend(ids, "", "TOZO NC9 Pro"), "tozo");
+  assertEquals(Model.isClassicBackend("huawei"), true);
+  assertEquals(Model.bridgeFor("huawei"), "huawei-bridge");
+  assertEquals(Model.bridgeArgs("huawei", { address: "AC:33:28:8C:A2:CD", name }),
+    ["AC:33:28:8C:A2:CD", name]);
+  // Battery only: the empty list hides the mode row.
+  assertEquals(Model.modesAvailable({ available: [] }, "huawei"), []);
+  assertEquals(Model.modeOptions([], "huawei"), []);
+});
+
+Deno.test("a device with no mode row is not told it cancels noise", () => {
+  const all = ["Counting electrons per ear", "Cancelling noise, politely", "Reading the room, ambiently"];
+  const modes = ["Cancelling noise, politely", "Reading the room, ambiently"];
+  assertEquals(Model.heroPhrases(all, modes, true), all);
+  assertEquals(Model.heroPhrases(all, modes, false), ["Counting electrons per ear"]);
+  // Never an empty list to index into.
+  assertEquals(Model.heroPhrases(modes, modes, false), modes);
+});
+
+Deno.test("TOZO six modes are explicit and keep the existing default four", () => {
+  const modes = ["off", "anc", "ambient", "wind", "leisure", "adaptive"];
+  assertEquals(Model.modesAvailable({available:modes}, "tozo"), modes);
+  assertEquals(Model.modesAvailable({}), ["off", "anc", "ambient", "talkthru"]);
+  assertEquals(Model.modeOptions(modes, "tozo").map(o => o.label),
+    ["Normal", "ANC", "Transparency", "Wind Noise", "Leisure", "Adaptive"]);
+  assertEquals(Model.modeOptions(Model.modesAvailable({}), "jbl").map(o => o.label),
+    ["Off", "ANC", "Ambient", "TalkThru"]);
+  const keys = Model.modeOptions(modes, "tozo").map(o => o.key);
+  assertEquals(new Set(keys).size, 6);
+});
+
+Deno.test("extra modes come from the backend row, and only that row", () => {
+  const six = ["off", "anc", "ambient", "wind", "leisure", "adaptive"];
+  for (const row of Model.BACKENDS.filter(r => r.name !== "tozo")) {
+    assertEquals(Model.modeNames(row.name), Model.MODE_ORDER, row.name);
+    assertEquals(Model.modesAvailable({ available: six }, row.name), ["off", "anc", "ambient"], row.name);
+    // The four default names, except where the row renames one through
+    // modeLabels (Redmi's Transparency).
+    const defaults = { off: "Off", anc: "ANC", ambient: "Ambient", talkthru: "TalkThru" };
+    assertEquals(Model.modeOptions(Model.MODE_ORDER, row.name).map(o => o.label),
+      Model.MODE_ORDER.map(m => (row.modeLabels || {})[m] || defaults[m]), row.name);
+  }
+  assertEquals(Model.modeOptions(Model.MODE_ORDER, "redmi").map(o => o.label),
+    ["Off", "ANC", "Transparency", "TalkThru"]);
+  assertEquals(Model.modesAvailable({ available: six }, ""), ["off", "anc", "ambient"]);
+  assertEquals(Model.modesAvailable({}, "tozo"), Model.MODE_ORDER);
+  assertEquals(Model.allModeNames(), [...Model.MODE_ORDER, "wind", "leisure", "adaptive"]);
+});
+
+// ---- Redmi Buds 5: its SDP record, as docs/captures/redmi-buds-5-bluetoothctl.txt
+//      printed it, and what must not be taken for it.
+
+const REDMI_BUDS_5_UUIDS = [
+  "00000001-0000-1000-8000-00805f9b34fb",
+  "00001101-0000-1000-8000-00805f9b34fb",
+  "00001108-0000-1000-8000-00805f9b34fb",
+  "0000110b-0000-1000-8000-00805f9b34fb",
+  "0000110c-0000-1000-8000-00805f9b34fb",
+  "0000110e-0000-1000-8000-00805f9b34fb",
+  "0000110f-0000-1000-8000-00805f9b34fb",
+  "0000111e-0000-1000-8000-00805f9b34fb",
+  "00001203-0000-1000-8000-00805f9b34fb",
+  "0000fd2d-0000-1000-8000-00805f9b34fb",
+  "66666666-6666-6666-6666-666666666666",
+  "99999999-9999-9999-9999-999999999999",
+  "df21fe2c-2515-4fdb-8886-f12c4d67927c",
+];
+const BLE_ADDRESS = "48:B4:41:00:00:01";
+
+Deno.test("Redmi Buds 5 is picked by its name and the 0xFD2D service, with or without a Fast Pair address", () => {
+  assertEquals(Model.controlBackend(REDMI_BUDS_5_UUIDS, "", "Redmi Buds 5"), "redmi");
+  assertEquals(Model.controlBackend(REDMI_BUDS_5_UUIDS, BLE_ADDRESS, "Redmi Buds 5"), "redmi");
+  assertEquals(Model.bridgeFor("redmi"), "redmi-bridge");
+  assertEquals(Model.bridgeArgs("redmi", { address: "AA:BB:CC:00:00:01", name: "Redmi Buds 5" }),
+    ["AA:BB:CC:00:00:01"]);
+  assertEquals(Model.isClassicBackend("redmi"), true);
+});
+
+Deno.test("only the Redmi row lets an empty Fast Pair stream give way to the bridge", () => {
+  for (const row of Model.BACKENDS)
+    assertEquals(Model.fastPairWithoutBattery(row.name), row.name === "redmi", row.name);
+  assertEquals(Model.fastPairWithoutBattery(""), false);
+  assertEquals(Model.fastPairWithoutBattery("nonesuch"), false);
+});
+
+Deno.test("neither the Redmi name nor its service alone is the claim", () => {
+  const withoutService = REDMI_BUDS_5_UUIDS.filter((id) => !id.startsWith("0000fd2d"));
+  assertEquals(Model.controlBackend(withoutService, "", "Redmi Buds 5"), "");
+  assertEquals(Model.controlBackend(REDMI_BUDS_5_UUIDS, "", "Some Other Buds"), "");
+  assertEquals(Model.controlBackend(REDMI_BUDS_5_UUIDS, "", ""), "");
+});
+
+Deno.test("the Redmi row takes no other device's claim, and every other claim still wins its own", () => {
+  const huawei = Model.controlBackend(["00001101-0000-1000-8000-00805f9b34fb"], "", "HUAWEI FreeBuds SE 2");
+  assertEquals(huawei, "huawei");
+  // The Buds 5 Pro advertise CSR GAIA, and stay on the xiaomi row even if they
+  // also list 0xFD2D.
+  assertEquals(Model.controlBackend([Model.BACKENDS.find((r) => r.name === "xiaomi").uuids[0],
+    "0000fd2d-0000-1000-8000-00805f9b34fb"], "", "Redmi Buds 5"), "xiaomi");
+  // A Fast Pair address alone, as for any other headset, is still the JBL row.
+  assertEquals(Model.controlBackend([], BLE_ADDRESS, "Redmi Buds 5"), "jbl");
+});
+
+Deno.test("a reader level above 100 is not a level", () => {
+  assertEquals(Model.readerLevel({ battery: 126 }, "battery"), -1);
+  assertEquals(Model.readerLevel({ battery: 101 }, "battery"), -1);
+  assertEquals(Model.readerLevel({ battery: 100 }, "battery"), 100);
+  assertEquals(Model.readerLevel({ battery: 0 }, "battery"), 0);
+  assertEquals(Model.readerLevel({ battery: -1 }, "battery"), -1);
+});
+
+Deno.test("the same earbuds listed on two adapters are the connected one, whichever comes first", () => {
+  const paired = { address: "AA:BB:CC:00:00:01", name: "Redmi Buds 5", connected: false, adapter: "dongle" };
+  const connected = { address: "AA:BB:CC:00:00:01", name: "Redmi Buds 5", connected: true, adapter: "internal" };
+  assertEquals(Model.deviceByAddress([paired, connected], "aa:bb:cc:00:00:01"), connected);
+  assertEquals(Model.deviceByAddress([connected, paired], "AA:BB:CC:00:00:01"), connected);
+  // Neither connected: the first, as before.
+  const other = { address: "AA:BB:CC:00:00:01", connected: false, adapter: "other" };
+  assertEquals(Model.deviceByAddress([paired, other], "AA:BB:CC:00:00:01"), paired);
+  assertEquals(Model.deviceByAddress([paired], "AA:BB:CC:00:00:02"), null);
+  assertEquals(Model.deviceByAddress([], "AA:BB:CC:00:00:01"), null);
+  assertEquals(Model.deviceByAddress([paired], ""), null);
+});
+
+// ---- EarFun Air Pro 4: its SDP record, docs/captures/earfun-air-pro-4-bluetoothctl.txt.
+
+const EARFUN_NAME = "EarFun Air Pro 4";
+
+async function earfunUuids() {
+  const record = await Deno.readTextFile(
+    new URL("../docs/captures/earfun-air-pro-4-bluetoothctl.txt", import.meta.url));
+  return Model.uuidsFromBluetoothctl(record);
+}
+
+Deno.test("EarFun Air Pro 4 is picked by its name and SPP, with or without its Fast Pair address", async () => {
+  const ids = await earfunUuids();
+  assertEquals(ids.length, 12, "complete captured UUID list");
+  for (const uuids of [ids, [...ids].reverse(), ids.map(id => id.toUpperCase())]) {
+    assertEquals(Model.controlBackend(uuids, "", EARFUN_NAME), "earfun");
+    // The address its Fast Pair stream announced: the JBL row would take it.
+    assertEquals(Model.controlBackend(uuids, "50:07:3D:6E:6E:42", EARFUN_NAME), "earfun");
+  }
+  assertEquals(Model.bridgeFor("earfun"), "earfun-bridge");
+  assertEquals(Model.isClassicBackend("earfun"), true);
+  assertEquals(Model.bridgeArgs("earfun", { address: "AA:BB:CC:00:00:02", name: EARFUN_NAME }),
+    ["AA:BB:CC:00:00:02", EARFUN_NAME]);
+  assertEquals(Model.fastPairWithoutBattery("earfun"), false);
+  assertEquals(Model.hasAmbientDial("earfun"), false);
+  assertEquals(Model.modeOptions(["off", "anc", "ambient"], "earfun").map(o => o.label),
+    ["Off", "ANC", "Ambient"]);
+});
+
+Deno.test("neither the EarFun name nor its record alone is the claim", async () => {
+  const ids = await earfunUuids();
+  const withoutSpp = ids.filter(id => id !== "00001101-0000-1000-8000-00805f9b34fb");
+  assertEquals(Model.controlBackend(withoutSpp, "", EARFUN_NAME), "");
+  assertEquals(Model.controlBackend(ids, "", ""), "");
+  assertEquals(Model.controlBackend(ids, "", "EarFun Air Pro 3"), "");
+  assertEquals(Model.controlBackend(ids, "", "EarFun Free Pro 3"), "");
+  // Without the name, the record goes where it went before this row.
+  assertEquals(Model.controlBackend(ids, "50:07:3D:6E:6E:42"), "jbl");
+  assertEquals(Model.controlBackend(withoutSpp, "50:07:3D:6E:6E:42", EARFUN_NAME), "jbl");
+});
+
+Deno.test("the EarFun row takes no other device's claim", () => {
+  for (const device of DEVICES) {
+    assertEquals(Model.controlBackend(device.uuids, device.bleAddress, EARFUN_NAME),
+      device.backend, device.model);
+  }
+  assertEquals(Model.controlBackend(["00001101-0000-1000-8000-00805f9b34fb"], "", "HUAWEI FreeBuds SE 2"), "huawei");
+  assertEquals(Model.controlBackend(["00001101-0000-1000-8000-00805f9b34fb"], "", "TOZO NC9 Pro"), "tozo");
+  assertEquals(Model.controlBackend(REDMI_BUDS_5_UUIDS, BLE_ADDRESS, "Redmi Buds 5"), "redmi");
+});
+
+// ---- Redmi Buds 3 Pro: its SDP record, docs/captures/redmi-buds-3-pro-bluetoothctl.txt.
+
+const REDMI_BUDS_3_PRO = "Redmi Buds 3 Pro";
+
+async function redmiBuds3ProUuids() {
+  const record = await Deno.readTextFile(
+    new URL("../docs/captures/redmi-buds-3-pro-bluetoothctl.txt", import.meta.url));
+  return Model.uuidsFromBluetoothctl(record);
+}
+
+Deno.test("Redmi Buds 3 Pro are picked by their name and 0xFD2D, and the bridge gets the name", async () => {
+  const ids = await redmiBuds3ProUuids();
+  assertEquals(ids.length, 12, "complete captured UUID list");
+  for (const uuids of [ids, [...ids].reverse(), ids.map(id => id.toUpperCase())])
+    assertEquals(Model.controlBackend(uuids, "", REDMI_BUDS_3_PRO), "redmi-buds-3-pro");
+  assertEquals(Model.bridgeFor("redmi-buds-3-pro"), "redmi-bridge");
+  assertEquals(Model.isClassicBackend("redmi-buds-3-pro"), true);
+  assertEquals(Model.bridgeArgs("redmi-buds-3-pro", { address: "AA:BB:CC:00:00:03", name: REDMI_BUDS_3_PRO }),
+    ["AA:BB:CC:00:00:03", REDMI_BUDS_3_PRO]);
+  assertEquals(Model.fastPairWithoutBattery("redmi-buds-3-pro"), false);
+  assertEquals(Model.hasAmbientDial("redmi-buds-3-pro"), false);
+  assertEquals(Model.modeOptions(["off", "anc", "ambient"], "redmi-buds-3-pro").map(o => o.label),
+    ["Off", "ANC", "Transparency"]);
+});
+
+Deno.test("neither the Buds 3 Pro name nor their record alone is the claim", async () => {
+  const ids = await redmiBuds3ProUuids();
+  const withoutService = ids.filter(id => !id.startsWith("0000fd2d"));
+  assertEquals(Model.controlBackend(withoutService, "", REDMI_BUDS_3_PRO), "");
+  assertEquals(Model.controlBackend(ids, "", ""), "");
+  assertEquals(Model.controlBackend(ids, "", "Redmi Buds 3"), "");
+  assertEquals(Model.controlBackend(ids, "", "Redmi Buds 5"), "redmi");
+});
+
+Deno.test("the Buds 3 Pro row takes no other device's claim, and the Buds 5 keep theirs", () => {
+  for (const device of DEVICES) {
+    assertEquals(Model.controlBackend(device.uuids, device.bleAddress, REDMI_BUDS_3_PRO),
+      device.backend, device.model);
+  }
+  assertEquals(Model.controlBackend(REDMI_BUDS_5_UUIDS, "", "Redmi Buds 5"), "redmi");
+  assertEquals(Model.bridgeArgs("redmi", { address: "AA:BB:CC:00:00:01", name: "Redmi Buds 5" }),
+    ["AA:BB:CC:00:00:01"]);
+  // The Buds 5 record with this name: the same service, so the row that names it.
+  assertEquals(Model.controlBackend(REDMI_BUDS_5_UUIDS, "", REDMI_BUDS_3_PRO), "redmi-buds-3-pro");
+});
+
+// ---- JBL Tour Pro 3: its SDP record, docs/captures/jbl-tour-pro-3-bluetoothctl.txt.
+
+const TOUR_PRO_3 = "JBL Tour Pro 3";
+
+async function tourPro3Uuids() {
+  const record = await Deno.readTextFile(
+    new URL("../docs/captures/jbl-tour-pro-3-bluetoothctl.txt", import.meta.url));
+  return Model.uuidsFromBluetoothctl(record);
+}
+
+Deno.test("JBL Tour Pro 3 is picked by its name and the Airoha RACE UUID, with or without its Fast Pair address", async () => {
+  const ids = await tourPro3Uuids();
+  assertEquals(ids.length, 15, "complete captured UUID list");
+  for (const uuids of [ids, [...ids].reverse(), ids.map(id => id.toUpperCase())]) {
+    assertEquals(Model.controlBackend(uuids, "", TOUR_PRO_3), "airoha");
+    // The address its Fast Pair stream announced: the JBL row would take it.
+    assertEquals(Model.controlBackend(uuids, "CE:6D:DD:59:9A:F2", TOUR_PRO_3), "airoha");
+  }
+  assertEquals(Model.bridgeFor("airoha"), "airoha-bridge");
+  assertEquals(Model.isClassicBackend("airoha"), true);
+  assertEquals(Model.isBleBackend("airoha"), false);
+  assertEquals(Model.bridgeArgs("airoha", { address: "AA:BB:CC:00:00:04", name: TOUR_PRO_3 }),
+    ["AA:BB:CC:00:00:04", TOUR_PRO_3]);
+  assertEquals(Model.fastPairWithoutBattery("airoha"), false);
+  assertEquals(Model.hasAmbientDial("airoha"), true);
+  assertEquals(Model.ambientRange("airoha"), { min: 1, max: 7, voice: "", command: "", key: "" });
+});
+
+Deno.test("neither the Tour Pro 3 name nor the Airoha UUID alone is the claim", async () => {
+  const ids = await tourPro3Uuids();
+  const withoutRace = ids.filter(id => id !== "00000000-0000-0000-0099-aabbccddeeff");
+  assertEquals(Model.controlBackend(withoutRace, "", TOUR_PRO_3), "");
+  assertEquals(Model.controlBackend(ids, "", ""), "");
+  assertEquals(Model.controlBackend(ids, "", "JBL Tour Pro 2"), "");
+  // Without the name, the record goes where it went before this row.
+  assertEquals(Model.controlBackend(ids, "CE:6D:DD:59:9A:F2"), "jbl");
+  assertEquals(Model.controlBackend(withoutRace, "CE:6D:DD:59:9A:F2", TOUR_PRO_3), "jbl");
+});
+
+Deno.test("the Tour Pro 3 row takes no other device's claim", () => {
+  for (const device of DEVICES) {
+    assertEquals(Model.controlBackend(device.uuids, device.bleAddress, TOUR_PRO_3),
+      device.backend, device.model);
+  }
+});

@@ -1,0 +1,10 @@
+# Moto Buds+ live capture 2026-11-09 — address 54:2F:04:11:D5:E8
+# Profile UUID fc9d9fe0-4899-11ee-be56-0242ac120002 (BlueZ NewConnection)
+# Bluetooth name/alias: moto buds+
+# Modalias: bluetooth:v02B0p0000d001F
+#
+# Battery 0x0005 response payload: 5c 5a ff  → L=92 R=90 case=0xFF (absent)
+# ANC get 0x0200 payload: 00 00 → off
+# ANC set 0x0201 payload 01 01 → ack + ntf 0x0204 01 01 (ANC)
+# ANC set 0x0201 payload 00 00 → ntf 0x0204 00 00 (off)
+# ANC get after set ANC: 01 01
