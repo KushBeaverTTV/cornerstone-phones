@@ -1,0 +1,148 @@
+{
+  "model": "Motorola Moto Buds+",
+  "owner": "KushBeaverTTV",
+  "bridge": "moto",
+  "capture": "docs/captures/moto-buds-plus.txt",
+  "notes": "Laid out from the 2026-11-09 capture. The battery-changed notification (0x0009) is assumed to carry the same L, R, case payload as the battery reply.",
+  "session": {},
+  "steps": [
+    {
+      "call": "open",
+      "note": "the channel is up: hello, the feature query, then battery and mode"
+    },
+    {
+      "sent": [
+        "48 45 41 44 08 00 00 00 80 00 00 00 00 00 66 77 c9 c3 54 41 49 4c",
+        "48 45 41 44 0c 00 00 0b 80 00 04 00 00 00 fc ff 05 00 09 99 7a c7 54 41 49 4c",
+        "48 45 41 44 08 00 00 05 80 00 00 00 00 00 c1 58 f1 91 54 41 49 4c",
+        "48 45 41 44 08 00 02 00 80 00 00 00 00 00 1b 70 ec 81 54 41 49 4c"
+      ]
+    },
+    {
+      "timers": [
+        2000,
+        6000,
+        15000
+      ],
+      "note": "ask again at 2 s, give up at 6 s, poll every 15 s"
+    },
+    {
+      "device": "48 45 41 44 0b 00 00 05 20 00 03 00 00 00 5c 5a ff 00 00 00 00 54 41 49 4c",
+      "note": "battery: L 92, R 90, case not reporting (0xFF); CRC slot 0 as the buds send it"
+    },
+    {
+      "line_count": 0,
+      "note": "nothing is printed before the mode is known"
+    },
+    {
+      "device": "48 45 41 44 0a 00 02 00 20 00 02 00 00 00 00 00 00 00 00 00 54 41 49 4c",
+      "note": "mode get answer: off"
+    },
+    {
+      "lines": [
+        {
+          "modes": true,
+          "mode": "off",
+          "available": [
+            "off",
+            "anc",
+            "ambient"
+          ],
+          "battery": {
+            "left": 92,
+            "right": 90
+          }
+        }
+      ]
+    },
+    {
+      "command": "set anc"
+    },
+    {
+      "sent_last": "48 45 41 44 0a 00 02 01 80 00 02 00 00 00 01 01 b5 03 7e 60 54 41 49 4c"
+    },
+    {
+      "device": "48 45 41 44 08 00 02 01 20 00 00 00 00 00 00 00 00 00 54 41 49 4c",
+      "note": "an empty acknowledgement: ask, do not assume"
+    },
+    {
+      "sent_last": "48 45 41 44 08 00 02 00 80 00 00 00 00 00 1b 70 ec 81 54 41 49 4c"
+    },
+    {
+      "device": "48 45 41 44 0a 00 02 04 40 00 02 00 00 00 01 01 00 00 00 00 54 41 49 4c",
+      "note": "the buds announce ANC"
+    },
+    {
+      "line": {
+        "modes": true,
+        "mode": "anc",
+        "available": [
+          "off",
+          "anc",
+          "ambient"
+        ],
+        "battery": {
+          "left": 92,
+          "right": 90
+        }
+      }
+    },
+    {
+      "device": "48 45 41 44 0a 00 02 00 20 00 02 00 00 00 01 01 00 00 00 00 54 41 49 4c",
+      "note": "the get answer agrees: no second line"
+    },
+    {
+      "line_count": 2
+    },
+    {
+      "command": "set off"
+    },
+    {
+      "sent_last": "48 45 41 44 0a 00 02 01 80 00 02 00 00 00 00 00 62 02 62 0e 54 41 49 4c"
+    },
+    {
+      "device": "48 45 41 44 0a 00 02 04 40 00 02 00 00 00 00 00 00 00 00 00 54 41 49 4c"
+    },
+    {
+      "line_has": {
+        "mode": "off"
+      }
+    },
+    {
+      "command": "set ambient"
+    },
+    {
+      "sent_last": "48 45 41 44 0a 00 02 01 80 00 02 00 00 00 02 00 e0 60 54 3c 54 41 49 4c"
+    },
+    {
+      "command": "set talkthru",
+      "note": "not a mode these buds have: nothing goes out"
+    },
+    {
+      "sent_last": "48 45 41 44 0a 00 02 01 80 00 02 00 00 00 02 00 e0 60 54 3c 54 41 49 4c"
+    },
+    {
+      "device": "48 45 41 44 0b 00 00 09 40 00 03 00 00 00 5b 5a 64 00 00 00 00 54 41 49 4c",
+      "note": "battery changed, with the case open at 100"
+    },
+    {
+      "line": {
+        "modes": true,
+        "mode": "off",
+        "available": [
+          "off",
+          "anc",
+          "ambient"
+        ],
+        "battery": {
+          "left": 91,
+          "right": 90,
+          "case": 100
+        }
+      }
+    },
+    {
+      "exit": null
+    }
+  ]
+}
