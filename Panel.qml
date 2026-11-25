@@ -125,7 +125,7 @@ Panel {
 
   function markPressed(headset, button) {
     if (button === Qt.RightButton) return openPanel("omarchy.bluetooth")
-    if (button === Qt.MiddleButton) return openPanel("omarchy.audio")
+    if (button === Qt.MiddleButton) return openAudioPanel()
     // A click on another headset's mark while open switches to it and stays
     // open; a click on the current one is the toggle.
     var switching = opened && current !== headset
@@ -135,7 +135,16 @@ Panel {
 
   function openPanel(target) {
     close()
+    if (bar && bar.shell && typeof bar.shell.summon === "function" && bar.shell.summon(target)) return
     if (bar) bar.run("omarchy-shell shell summon " + target)
+  }
+
+  function openAudioPanel() {
+    close()
+    if (bar && bar.shell && typeof bar.shell.summon === "function") {
+      if (bar.shell.summon("cornerstone.audio") || bar.shell.summon("omarchy.audio")) return
+    }
+    if (bar) bar.run("omarchy-shell shell summon cornerstone.audio || omarchy-shell shell summon omarchy.audio")
   }
 
   function stepHeadset(delta) {
@@ -226,7 +235,7 @@ Panel {
   function pressKey(key) {
     var k = Text.str(key).toLowerCase()
     if (k === "b") openPanel("omarchy.bluetooth")
-    else if (k === "v") openPanel("omarchy.audio")
+    else if (k === "v") openAudioPanel()
     else if (k === "r") { if (current) current.refresh() }
     else if (k === "[") stepSlider(-1)
     else if (k === "]") stepSlider(1)
